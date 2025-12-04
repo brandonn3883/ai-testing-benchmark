@@ -1,5 +1,3 @@
-package com.benchmark;
-
 import com.ibm.icu.text.Transliterator;
 import java.io.IOException;
 import java.io.InputStream;

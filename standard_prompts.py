@@ -71,7 +71,7 @@ OUTPUT FORMAT:
         if language == "python" and module_name:
             import_instruction = f"\nIMPORTANT: Import the functions to test using: from {module_name} import *\n"
         elif language == "java" and module_name:
-            import_instruction = f"\nIMPORTANT: Import the class using: import {module_name};\n"
+            import_instruction = f"\nIMPORTANT: Do not include a package declaration and do not import any other libraries other than those from the source code and JUnit\n"
         elif language == "javascript":
             if module_name:
                 import_instruction = f"""

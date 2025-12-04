@@ -19,6 +19,11 @@ ANTHROPIC_API_KEY=
 GOOGLE_API_KEY=
 ```
 
+Add your source code into the respective folders as follows:
+<language>\<projectName>\src\HERE
+
+For example, if I wanted to add a Python project called Slugify, I would add it to the python folder, name the directory "slugify", and then put the source code slugify.py into the src folder.
+
 ## Usage
 
 ```bash

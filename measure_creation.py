@@ -391,6 +391,19 @@ class TestCreationMeasurer:
         test_output_dir = self.work_dir / "generated_tests"
         test_output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Setup Maven project structure
+        self._setup_maven_project(test_output_dir, debug)
+        
+        # Maven source directories
+        main_java = test_output_dir / "src" / "main" / "java"
+        test_java = test_output_dir / "src" / "test" / "java"
+        main_java.mkdir(parents=True, exist_ok=True)
+        test_java.mkdir(parents=True, exist_ok=True)
+        
+        # Copy source files to src/main/java
+        for source_file in source_files:
+            shutil.copy(source_file, main_java / source_file.name)
+        
         # Generate tests
         start_time = time.time()
         
@@ -405,7 +418,7 @@ class TestCreationMeasurer:
                     generated_test = self._extract_code_from_response(generated_test, "java")
                     
                     test_filename = f"{source_file.stem}Test.java"
-                    test_path = test_output_dir / test_filename
+                    test_path = test_java / test_filename
                     test_path.write_text(generated_test, encoding='utf-8')
                     measurement.test_files_created += 1
                     print(f"    Generated: {test_filename}")
@@ -421,6 +434,114 @@ class TestCreationMeasurer:
         
         return measurement
     
+    def _setup_maven_project(self, project_dir: Path, debug: bool = False):
+        """Setup Maven project structure with pom.xml."""
+        pom_file = project_dir / "pom.xml"
+        
+        if pom_file.exists():
+            return  # Already setup
+        
+        if debug:
+            print("    [DEBUG] Setting up Maven project...")
+        
+        pom_content = '''<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.benchmark</groupId>
+    <artifactId>test-project</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- JUnit 5 -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.30</version>
+            <scope>provided</scope>
+        </dependency>
+        
+        <!-- ICU4J for Transliterator -->
+        <dependency>
+            <groupId>com.ibm.icu</groupId>
+            <artifactId>icu4j</artifactId>
+            <version>74.2</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Compiler plugin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>11</source>
+                    <target>11</target>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>1.18.30</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            
+            <!-- Surefire plugin for running tests -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.2</version>
+                <configuration>
+                    <testFailureIgnore>true</testFailureIgnore>
+                </configuration>
+            </plugin>
+            
+            <!-- JaCoCo plugin for coverage -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.11</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+'''
+        pom_file.write_text(pom_content, encoding='utf-8')
+    
     def _run_java_coverage(
         self,
         measurement: CreationMeasurement,
@@ -428,156 +549,123 @@ class TestCreationMeasurer:
         test_dir: Path,
         debug: bool = False
     ):
-        """Run Java tests with JaCoCo coverage."""
+        """Run Java tests with Maven and JaCoCo coverage."""
         
-        # Copy source files to test directory
-        for src_file in project_path.glob("*.java"):
-            if "Test" not in src_file.name:
-                shutil.copy(src_file, test_dir / src_file.name)
+        import platform
+        is_windows = platform.system() == "Windows"
+        mvn_cmd = "mvn.cmd" if is_windows else "mvn"
         
-        # Check if javac and java are available
+        # Check if Maven is available
         try:
-            subprocess.run(["javac", "--version"], capture_output=True, check=True)
+            subprocess.run([mvn_cmd, "--version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print("    Warning: javac not found, skipping coverage")
+            print("    Warning: Maven not found, skipping Java coverage")
             return
-        
-        # Download JUnit and JaCoCo if not present
-        lib_dir = test_dir / "lib"
-        lib_dir.mkdir(exist_ok=True)
-        
-        junit_jar = lib_dir / "junit-platform-console-standalone.jar"
-        jacoco_agent = lib_dir / "jacocoagent.jar"
-        jacoco_cli = lib_dir / "jacococli.jar"
-        
-        # Download dependencies if needed
-        if not junit_jar.exists():
-            if debug:
-                print("    [DEBUG] Downloading JUnit...")
-            self._download_file(
-                "https://repo1.maven.org/maven2/org/junit/platform/junit-platform-console-standalone/1.10.0/junit-platform-console-standalone-1.10.0.jar",
-                junit_jar
-            )
-        
-        if not jacoco_agent.exists():
-            if debug:
-                print("    [DEBUG] Downloading JaCoCo agent...")
-            self._download_file(
-                "https://repo1.maven.org/maven2/org/jacoco/org.jacoco.agent/0.8.11/org.jacoco.agent-0.8.11-runtime.jar",
-                jacoco_agent
-            )
-        
-        if not jacoco_cli.exists():
-            if debug:
-                print("    [DEBUG] Downloading JaCoCo CLI...")
-            self._download_file(
-                "https://repo1.maven.org/maven2/org/jacoco/org.jacoco.cli/0.8.11/org.jacoco.cli-0.8.11-nodeps.jar",
-                jacoco_cli
-            )
-        
-        # Compile source and test files
-        java_files = list(test_dir.glob("*.java"))
-        if not java_files:
-            return
-        
-        classpath = f"{junit_jar}{os.pathsep}."
         
         if debug:
-            print(f"    [DEBUG] Compiling {len(java_files)} Java files...")
+            print("    [DEBUG] Running Maven test with coverage...")
         
-        compile_result = subprocess.run(
-            ["javac", "-cp", classpath, "-d", "."] + [str(f) for f in java_files],
-            capture_output=True,
-            text=True,
-            cwd=str(test_dir)
-        )
-        
-        if compile_result.returncode != 0:
-            if debug:
-                print(f"    [DEBUG] Compilation failed: {compile_result.stderr[:500]}")
-            measurement.compilation_errors.append(compile_result.stderr)
-            return
-        
-        measurement.tests_compilable = measurement.test_files_created
-        
-        # Find test classes
-        test_classes = [f.stem for f in test_dir.glob("*Test.java")]
-        if not test_classes:
-            return
-        
-        # Run tests with JaCoCo agent
-        jacoco_exec = test_dir / "jacoco.exec"
-        
-        if debug:
-            print(f"    [DEBUG] Running tests with JaCoCo...")
-        
-        test_result = subprocess.run(
-            [
-                "java",
-                f"-javaagent:{jacoco_agent}=destfile={jacoco_exec}",
-                "-jar", str(junit_jar),
-                "--class-path", ".",
-                "--scan-class-path"
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(test_dir),
-            timeout=120
-        )
-        
-        if debug:
-            print(f"    [DEBUG] Test output: {test_result.stdout[-500:]}")
-        
-        # Parse test results
-        output = test_result.stdout
-        passed = re.search(r"(\d+) tests successful", output)
-        failed = re.search(r"(\d+) tests failed", output)
-        
-        measurement.tests_passing = int(passed.group(1)) if passed else 0
-        
-        # Generate coverage report
-        if jacoco_exec.exists():
-            # Get source class files (not test classes)
-            source_classes = [f.stem for f in project_path.glob("*.java") if "Test" not in f.name]
-            
-            report_result = subprocess.run(
-                [
-                    "java", "-jar", str(jacoco_cli),
-                    "report", str(jacoco_exec),
-                    "--classfiles", ".",
-                    "--sourcefiles", ".",
-                    "--csv", "coverage.csv"
-                ],
+        # Run mvn test (this compiles, runs tests, and generates coverage)
+        try:
+            test_result = subprocess.run(
+                [mvn_cmd, "test", "-q"],
                 capture_output=True,
                 text=True,
-                cwd=str(test_dir)
+                cwd=str(test_dir),
+                timeout=300,  # 5 minute timeout for Maven
+                encoding='utf-8',
+                errors='replace'
             )
             
-            # Parse coverage CSV
-            coverage_csv = test_dir / "coverage.csv"
+            output = (test_result.stdout or "") + (test_result.stderr or "")
+            
+            if debug:
+                print(f"    [DEBUG] Maven output (last 800 chars): {output[-800:]}")
+            
+            # Check for compilation errors
+            if "COMPILATION ERROR" in output or "cannot find symbol" in output:
+                if debug:
+                    print("    [DEBUG] Compilation failed")
+                measurement.compilation_errors.append(output[-1000:])
+                return
+            
+            measurement.tests_compilable = measurement.test_files_created
+            
+            # Parse test results from Maven output
+            # Tests run: 5, Failures: 1, Errors: 0, Skipped: 0
+            tests_match = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)", output)
+            if tests_match:
+                total = int(tests_match.group(1))
+                failures = int(tests_match.group(2))
+                errors = int(tests_match.group(3))
+                measurement.tests_passing = total - failures - errors
+            
+            # Parse coverage from JaCoCo CSV report
+            coverage_csv = test_dir / "target" / "site" / "jacoco" / "jacoco.csv"
             if coverage_csv.exists():
-                coverage_data = coverage_csv.read_text()
-                lines = coverage_data.strip().split('\n')
-                if len(lines) > 1:
-                    total_covered = 0
-                    total_missed = 0
-                    for line in lines[1:]:  # Skip header
-                        parts = line.split(',')
-                        if len(parts) >= 8:
-                            # CSV format: GROUP,PACKAGE,CLASS,INSTRUCTION_MISSED,INSTRUCTION_COVERED,...
-                            try:
-                                missed = int(parts[7])  # LINE_MISSED
-                                covered = int(parts[8])  # LINE_COVERED
-                                total_missed += missed
-                                total_covered += covered
-                            except (ValueError, IndexError):
-                                pass
+                self._parse_jacoco_csv(measurement, coverage_csv, debug)
+            else:
+                # Try XML report
+                coverage_xml = test_dir / "target" / "site" / "jacoco" / "jacoco.xml"
+                if coverage_xml.exists():
+                    self._parse_jacoco_xml(measurement, coverage_xml, debug)
+                elif debug:
+                    print("    [DEBUG] No JaCoCo report found")
                     
-                    total = total_covered + total_missed
-                    if total > 0:
-                        measurement.line_coverage = (total_covered / total) * 100
-                        if debug:
-                            print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+        except subprocess.TimeoutExpired:
+            print("    Warning: Maven timed out")
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Maven error: {e}")
+    
+    def _parse_jacoco_csv(self, measurement: CreationMeasurement, csv_path: Path, debug: bool = False):
+        """Parse JaCoCo CSV coverage report."""
+        try:
+            coverage_data = csv_path.read_text(encoding='utf-8')
+            lines = coverage_data.strip().split('\n')
+            if len(lines) > 1:
+                total_covered = 0
+                total_missed = 0
+                for line in lines[1:]:  # Skip header
+                    parts = line.split(',')
+                    if len(parts) >= 8:
+                        try:
+                            missed = int(parts[7])  # LINE_MISSED
+                            covered = int(parts[8])  # LINE_COVERED
+                            total_missed += missed
+                            total_covered += covered
+                        except (ValueError, IndexError):
+                            pass
+                
+                total = total_covered + total_missed
+                if total > 0:
+                    measurement.line_coverage = (total_covered / total) * 100
+                    if debug:
+                        print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Error parsing coverage CSV: {e}")
+    
+    def _parse_jacoco_xml(self, measurement: CreationMeasurement, xml_path: Path, debug: bool = False):
+        """Parse JaCoCo XML coverage report."""
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            
+            # Find LINE counter
+            for counter in root.findall(".//counter[@type='LINE']"):
+                missed = int(counter.get('missed', 0))
+                covered = int(counter.get('covered', 0))
+                total = missed + covered
+                if total > 0:
+                    measurement.line_coverage = (covered / total) * 100
+                    if debug:
+                        print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+                    break
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Error parsing coverage XML: {e}")
     
     def _download_file(self, url: str, dest: Path):
         """Download a file from URL."""
@@ -746,6 +834,8 @@ class TestCreationMeasurer:
         
         # Fix imports in test files (convert ES Modules to CommonJS)
         for test_file in test_dir.glob("*.test.js"):
+            self._fix_javascript_imports(test_file, debug)
+        for test_file in test_dir.glob("*.spec.js"):
             self._fix_javascript_imports(test_file, debug)
         
         # Check if node is available

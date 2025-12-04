@@ -487,17 +487,22 @@ class TestExecutionMeasurer:
         project_path = Path(project_path).resolve()
         test_path = Path(test_path).resolve()
         
-        # Check for compiled classes
-        if not list(test_path.glob("*.class")):
+        import platform
+        is_windows = platform.system() == "Windows"
+        mvn_cmd = "mvn.cmd" if is_windows else "mvn"
+        
+        # Check for Maven project structure
+        pom_file = test_path / "pom.xml"
+        if not pom_file.exists():
             if debug:
-                print("    [DEBUG] No compiled Java classes found, skipping mutation testing")
+                print("    [DEBUG] No pom.xml found, skipping Java mutation testing")
             return measurement
         
-        # Run baseline tests
+        # Run baseline tests with Maven
         if debug:
             print("    [DEBUG] Running baseline Java tests...")
         
-        baseline = self._run_java_tests(test_path, debug)
+        baseline = self._run_java_tests_maven(test_path, mvn_cmd, is_windows, debug)
         measurement.total_test_cases = baseline["total"]
         measurement.tests_passed = baseline["passed"]
         measurement.tests_failed = baseline["failed"]
@@ -511,10 +516,17 @@ class TestExecutionMeasurer:
         if debug:
             print("    [DEBUG] Starting Java mutation testing...")
         
-        source_files = [f for f in test_path.glob("*.java") if "Test" not in f.name]
+        # Find source files in src/main/java
+        main_java = test_path / "src" / "main" / "java"
+        source_files = list(main_java.glob("*.java")) if main_java.exists() else []
+        
+        if not source_files:
+            if debug:
+                print("    [DEBUG] No source files found for mutation")
+            return measurement
         
         mutation_results = self._run_java_mutation_testing(
-            source_files, test_path, max_mutants, debug
+            source_files, test_path, mvn_cmd, is_windows, max_mutants, debug
         )
         
         measurement.total_mutants = mutation_results["total"]
@@ -527,34 +539,39 @@ class TestExecutionMeasurer:
         
         return measurement
     
-    def _run_java_tests(self, test_dir: Path, debug: bool = False) -> dict:
-        """Run JUnit tests and return results."""
+    def _run_java_tests_maven(self, test_dir: Path, mvn_cmd: str, is_windows: bool, debug: bool = False) -> dict:
+        """Run Maven tests and return results."""
         results = {"total": 0, "passed": 0, "failed": 0, "duration": 0.0}
-        
-        junit_jar = test_dir / "lib" / "junit-platform-console-standalone.jar"
-        if not junit_jar.exists():
-            return results
         
         try:
             result = subprocess.run(
-                ["java", "-jar", str(junit_jar), "--class-path", ".", "--scan-class-path"],
+                [mvn_cmd, "test", "-q"],
                 capture_output=True,
                 text=True,
                 cwd=str(test_dir),
-                timeout=120
+                timeout=300,
+                encoding='utf-8',
+                errors='replace'
             )
             
-            output = result.stdout
-            passed = re.search(r"(\d+) tests successful", output)
-            failed = re.search(r"(\d+) tests failed", output)
+            output = (result.stdout or "") + (result.stderr or "")
             
-            results["passed"] = int(passed.group(1)) if passed else 0
-            results["failed"] = int(failed.group(1)) if failed else 0
-            results["total"] = results["passed"] + results["failed"]
+            # Parse: Tests run: 5, Failures: 1, Errors: 0, Skipped: 0
+            tests_match = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)", output)
+            if tests_match:
+                total = int(tests_match.group(1))
+                failures = int(tests_match.group(2))
+                errors = int(tests_match.group(3))
+                results["total"] = total
+                results["passed"] = total - failures - errors
+                results["failed"] = failures + errors
             
+            if debug:
+                print(f"    [DEBUG] Maven test results: {results}")
+                
         except Exception as e:
             if debug:
-                print(f"    [DEBUG] Java test error: {e}")
+                print(f"    [DEBUG] Maven test error: {e}")
         
         return results
     
@@ -562,14 +579,22 @@ class TestExecutionMeasurer:
         self,
         source_files: list,
         test_dir: Path,
+        mvn_cmd: str,
+        is_windows: bool,
         max_mutants: int,
         debug: bool
     ) -> dict:
-        """Run mutation testing on Java source files."""
+        """Run mutation testing on Java source files using Maven."""
         results = {"total": 0, "killed": 0, "survived": 0}
         
         mutation_dir = self.work_dir / "mutations"
-        mutation_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get baseline failure count to compare against
+        baseline = self._run_java_tests_maven(test_dir, mvn_cmd, is_windows, False)
+        baseline_failed = baseline["failed"]
+        
+        if debug:
+            print(f"    [DEBUG] Baseline: {baseline['passed']} passed, {baseline_failed} failed")
         
         for source_file in source_files:
             code = source_file.read_text(encoding='utf-8')
@@ -584,7 +609,10 @@ class TestExecutionMeasurer:
                 if debug:
                     print(f"    [DEBUG] Testing mutant {results['total']}: {desc} at line {line_num}")
                 
-                killed = self._test_java_mutant(source_file, mutant_code, test_dir, mutation_dir, debug)
+                killed = self._test_java_mutant_maven(
+                    source_file, mutant_code, test_dir, mutation_dir, 
+                    mvn_cmd, is_windows, baseline_failed, debug
+                )
                 
                 if killed:
                     results["killed"] += 1
@@ -618,62 +646,63 @@ class TestExecutionMeasurer:
         
         return mutants
     
-    def _test_java_mutant(
+    def _test_java_mutant_maven(
         self,
         source_file: Path,
         mutant_code: str,
         test_dir: Path,
         mutation_dir: Path,
+        mvn_cmd: str,
+        is_windows: bool,
+        baseline_failed: int,
         debug: bool
     ) -> bool:
-        """Test a Java mutant. Returns True if killed."""
-        # Clear mutation dir
-        for f in mutation_dir.glob("*"):
-            if f.is_file():
-                f.unlink()
+        """Test a Java mutant using Maven. Returns True if killed."""
+        # Copy entire Maven project to mutation dir
+        if mutation_dir.exists():
+            shutil.rmtree(mutation_dir)
+        shutil.copytree(test_dir, mutation_dir, ignore=shutil.ignore_patterns('target'))
         
-        # Copy files
-        for f in test_dir.glob("*.java"):
-            shutil.copy(f, mutation_dir / f.name)
-        for f in test_dir.glob("*.class"):
-            shutil.copy(f, mutation_dir / f.name)
-        
-        # Copy lib directory
-        lib_src = test_dir / "lib"
-        lib_dst = mutation_dir / "lib"
-        if lib_src.exists() and not lib_dst.exists():
-            shutil.copytree(lib_src, lib_dst)
-        
-        # Write mutant
-        mutant_file = mutation_dir / source_file.name
+        # Write mutant to src/main/java
+        main_java = mutation_dir / "src" / "main" / "java"
+        mutant_file = main_java / source_file.name
         mutant_file.write_text(mutant_code, encoding='utf-8')
         
-        # Recompile
-        junit_jar = mutation_dir / "lib" / "junit-platform-console-standalone.jar"
-        compile_result = subprocess.run(
-            ["javac", "-cp", f"{junit_jar}{os.pathsep}.", str(mutant_file)],
-            capture_output=True,
-            cwd=str(mutation_dir),
-            timeout=30
-        )
-        
-        if compile_result.returncode != 0:
-            return True  # Compilation error = killed
-        
-        # Run tests
+        # Run Maven test
         try:
             result = subprocess.run(
-                ["java", "-jar", str(junit_jar), "--class-path", ".", "--scan-class-path"],
+                [mvn_cmd, "test", "-q"],
                 capture_output=True,
                 text=True,
                 cwd=str(mutation_dir),
-                timeout=30
+                timeout=120,
+                encoding='utf-8',
+                errors='replace'
             )
-            return result.returncode != 0  # Tests failed = killed
+            
+            output = (result.stdout or "") + (result.stderr or "")
+            
+            # Check for compilation failure
+            if "COMPILATION ERROR" in output:
+                return True  # Compilation error = killed
+            
+            # Parse test results: Tests run: X, Failures: Y, Errors: Z
+            tests_match = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)", output)
+            if tests_match:
+                failures = int(tests_match.group(2))
+                errors = int(tests_match.group(3))
+                mutant_failed = failures + errors
+                
+                # Mutant is killed if it causes MORE failures than baseline
+                return mutant_failed > baseline_failed
+            
+            # If we can't parse, check return code as fallback
+            return result.returncode != 0
+            
         except subprocess.TimeoutExpired:
-            return True
+            return True  # Timeout = killed
         except Exception:
-            return True
+            return True  # Error = killed
     
     def measure_javascript(
         self,
