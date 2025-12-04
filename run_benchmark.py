@@ -106,11 +106,16 @@ class BenchmarkRunner:
             if verbose:
                 print("\n[1/3] Test Creation...")
             try:
+                # Create a wrapper that passes the correct language to generate_tests
+                # Python passes (code, module_name), Java/JS pass just (code)
+                def make_generator(lang):
+                    return lambda code, module_name=None: bot.generate_tests(code, module_name=module_name, language=lang)
+                
                 if language == "python":
                     result["creation"] = self.creation_measurer.measure_python(
                         bot_name=bot.name,
                         project_path=project_path,
-                        generate_tests=bot.generate_tests,
+                        generate_tests=make_generator("python"),
                         project_name=project_name,
                         debug=debug
                     )
@@ -118,35 +123,60 @@ class BenchmarkRunner:
                     result["creation"] = self.creation_measurer.measure_java(
                         bot_name=bot.name,
                         project_path=project_path,
-                        generate_tests=bot.generate_tests,
-                        project_name=project_name
+                        generate_tests=make_generator("java"),
+                        project_name=project_name,
+                        debug=debug
                     )
                 elif language == "javascript":
                     result["creation"] = self.creation_measurer.measure_javascript(
                         bot_name=bot.name,
                         project_path=project_path,
-                        generate_tests=bot.generate_tests,
-                        project_name=project_name
+                        generate_tests=make_generator("javascript"),
+                        project_name=project_name,
+                        debug=debug
                     )
                 if verbose and result["creation"]:
                     print(f"    Coverage: {result['creation'].line_coverage:.1f}%")
             except Exception as e:
                 print(f"    Error: {e}")
+                if debug:
+                    import traceback
+                    traceback.print_exc()
         
         # Phase 2: Test Maintenance (fix broken tests before mutation testing)
         if run_maintenance:
             if verbose:
                 print("\n[2/3] Test Maintenance...")
             try:
-                if generated_test_dir.exists() and language == "python":
-                    result["maintenance"] = self.maintenance_measurer.measure_python(
-                        bot_name=bot.name,
-                        repair_function=bot.repair_test,
-                        test_dir=str(generated_test_dir),
-                        source_dir=project_path,
-                        project_name=project_name,
-                        debug=debug
-                    )
+                if generated_test_dir.exists():
+                    if language == "python":
+                        result["maintenance"] = self.maintenance_measurer.measure_python(
+                            bot_name=bot.name,
+                            repair_function=bot.repair_test,
+                            test_dir=str(generated_test_dir),
+                            source_dir=project_path,
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    elif language == "java":
+                        result["maintenance"] = self.maintenance_measurer.measure_java(
+                            bot_name=bot.name,
+                            repair_function=bot.repair_test,
+                            test_dir=str(generated_test_dir),
+                            source_dir=project_path,
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    elif language == "javascript":
+                        result["maintenance"] = self.maintenance_measurer.measure_javascript(
+                            bot_name=bot.name,
+                            repair_function=bot.repair_test,
+                            test_dir=str(generated_test_dir),
+                            source_dir=project_path,
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    
                     if verbose and result["maintenance"]:
                         m = result["maintenance"]
                         if m.total_broken_tests == 0:
@@ -163,20 +193,41 @@ class BenchmarkRunner:
                         print("    Skipped (no generated tests)")
             except Exception as e:
                 print(f"    Error: {e}")
+                if debug:
+                    import traceback
+                    traceback.print_exc()
         
         # Phase 3: Test Execution with Mutation Testing (on fixed tests)
         if run_execution:
             if verbose:
                 print("\n[3/3] Test Execution (Mutation Testing)...")
             try:
-                if generated_test_dir.exists() and language == "python":
-                    result["execution"] = self.execution_measurer.measure_python(
-                        bot_name=bot.name,
-                        project_path=project_path,
-                        test_path=str(generated_test_dir),
-                        project_name=project_name,
-                        debug=debug
-                    )
+                if generated_test_dir.exists():
+                    if language == "python":
+                        result["execution"] = self.execution_measurer.measure_python(
+                            bot_name=bot.name,
+                            project_path=project_path,
+                            test_path=str(generated_test_dir),
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    elif language == "java":
+                        result["execution"] = self.execution_measurer.measure_java(
+                            bot_name=bot.name,
+                            project_path=project_path,
+                            test_path=str(generated_test_dir),
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    elif language == "javascript":
+                        result["execution"] = self.execution_measurer.measure_javascript(
+                            bot_name=bot.name,
+                            project_path=project_path,
+                            test_path=str(generated_test_dir),
+                            project_name=project_name,
+                            debug=debug
+                        )
+                    
                     if verbose and result["execution"]:
                         e = result["execution"]
                         print(f"    Tests: {e.tests_passed} passed, {e.tests_failed} failed")
@@ -189,6 +240,9 @@ class BenchmarkRunner:
                         print("    Skipped (no generated tests)")
             except Exception as e:
                 print(f"    Error: {e}")
+                if debug:
+                    import traceback
+                    traceback.print_exc()
         
         # Display results
         if verbose:

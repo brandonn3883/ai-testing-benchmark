@@ -31,9 +31,19 @@ class StandardPrompts:
         framework_map = {
             "python": "pytest",
             "java": "JUnit 5",
-            "javascript": "Jest"
+            "javascript": "Jest with CommonJS"
         }
         framework = framework_map.get(language, "appropriate testing framework")
+        
+        # Language-specific instructions
+        if language == "javascript":
+            extra_instructions = """
+7. Use CommonJS syntax (require/module.exports), NOT ES Modules (import/export)
+8. Do NOT use: import { jest } from '@jest/globals' or any import statements
+9. Use: const { functionName } = require('./moduleName'); for imports
+10. Use: describe(), it(), expect() - these are available globally in Jest"""
+        else:
+            extra_instructions = ""
         
         return f"""You are a software testing expert. Your task is to generate comprehensive unit tests.
 
@@ -47,7 +57,7 @@ REQUIREMENTS:
    - Type validation where applicable
 4. Use descriptive test names that explain what is being tested
 5. Include meaningful assertions with clear expected values
-6. Each test should be independent and not rely on other tests
+6. Each test should be independent and not rely on other tests{extra_instructions}
 
 OUTPUT FORMAT:
 - Return ONLY valid, runnable test code
@@ -59,11 +69,22 @@ OUTPUT FORMAT:
         """User prompt for test generation (used by all LLMs)."""
         
         if language == "python" and module_name:
-            import_instruction = f"\nIMPORTANT: Import the functions to test using: from src.{module_name} import *\n"
+            import_instruction = f"\nIMPORTANT: Import the functions to test using: from {module_name} import *\n"
         elif language == "java" and module_name:
             import_instruction = f"\nIMPORTANT: Import the class using: import {module_name};\n"
-        elif language == "javascript" and module_name:
-            import_instruction = f"\nIMPORTANT: Import the module using: const {{ ... }} = require('./{module_name}');\n"
+        elif language == "javascript":
+            if module_name:
+                import_instruction = f"""
+CRITICAL: Use CommonJS require syntax, NOT ES Module import syntax.
+Example: const {{ functionName }} = require('./{module_name}');
+Do NOT use: import {{ functionName }} from './{module_name}';
+Do NOT use: import {{ jest }} from '@jest/globals';
+"""
+            else:
+                import_instruction = """
+CRITICAL: Use CommonJS require syntax, NOT ES Module import syntax.
+Do NOT use any import statements. Use require() instead.
+"""
         else:
             import_instruction = ""
         

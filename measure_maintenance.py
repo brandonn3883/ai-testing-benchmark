@@ -37,13 +37,15 @@ class MaintenanceMeasurement:
     project_name: str
     
     # Key metrics
-    total_broken_tests: int = 0
-    successful_repairs: int = 0
-    failed_repairs: int = 0
+    total_broken_tests: int = 0           # Unique broken tests found
+    successful_repairs: int = 0            # Tests successfully fixed
+    failed_repairs: int = 0                # Tests that couldn't be fixed after all attempts
     
-    # Attempt tracking
-    total_repair_attempts: int = 0  # Total attempts across all repairs
-    first_attempt_fixes: int = 0    # Fixed on first try
+    # Attempt tracking (running totals)
+    total_repair_attempts: int = 0         # Total API calls made (running total)
+    successful_attempts: int = 0           # Attempts that resulted in a fix
+    failed_attempts: int = 0               # Attempts that failed (running total)
+    first_attempt_fixes: int = 0           # Fixed on first try
     
     # Supporting info
     total_repair_time_seconds: float = 0.0
@@ -58,6 +60,12 @@ class MaintenanceMeasurement:
         if self.total_broken_tests == 0:
             return None  # N/A - no errors to fix
         return round((self.successful_repairs / self.total_broken_tests) * 100, 2)
+    
+    def get_attempt_success_rate(self) -> float | None:
+        """Return percentage of attempts that succeeded."""
+        if self.total_repair_attempts == 0:
+            return None
+        return round((self.successful_attempts / self.total_repair_attempts) * 100, 2)
     
     def get_efficiency_score(self) -> float | None:
         """
@@ -181,6 +189,7 @@ class TestMaintenanceMeasurer:
                         repair_time = time.time() - start_time
                         measurement.total_repair_time_seconds += repair_time
                         measurement.successful_repairs += 1
+                        measurement.successful_attempts += 1
                         
                         if attempts == 1:
                             measurement.first_attempt_fixes += 1
@@ -206,6 +215,9 @@ class TestMaintenanceMeasurer:
                         if debug:
                             print(f"    [DEBUG] Successfully fixed: {broken_test.test_name} (attempt {attempts})")
                     else:
+                        # This attempt failed - track it
+                        measurement.failed_attempts += 1
+                        
                         # Update for next attempt
                         current_code = fixed_code
                         current_error = new_error
@@ -215,6 +227,8 @@ class TestMaintenanceMeasurer:
                             print(f"    [DEBUG] Fix attempt {attempts} failed, new error: {new_error_type}")
                             
                 except Exception as e:
+                    # This attempt failed due to exception
+                    measurement.failed_attempts += 1
                     if debug:
                         print(f"    [DEBUG] Error during repair attempt {attempts}: {e}")
             
@@ -528,6 +542,300 @@ class TestMaintenanceMeasurer:
                 break
         
         return error_type, error_message
+    
+    def measure_java(
+        self,
+        bot_name: str,
+        repair_function: Callable[[str, str, str], str],
+        test_dir: str,
+        source_dir: str,
+        project_name: str = "unnamed",
+        debug: bool = False
+    ) -> MaintenanceMeasurement:
+        """Measure test maintenance for Java."""
+        measurement = MaintenanceMeasurement(
+            bot_name=bot_name,
+            language="java",
+            project_name=project_name
+        )
+        
+        test_dir = Path(test_dir)
+        source_dir = Path(source_dir)
+        
+        # Find syntax errors by trying to compile
+        broken_tests = self._find_java_errors(test_dir, debug)
+        
+        measurement.total_broken_tests = len(broken_tests)
+        
+        if not broken_tests:
+            if debug:
+                print("    [DEBUG] No broken Java tests found")
+            return measurement
+        
+        print(f"    Found {len(broken_tests)} broken test(s)")
+        
+        # Try to fix each broken test with retries
+        for broken_test in broken_tests:
+            current_code = broken_test.code
+            current_error = broken_test.error_message
+            current_error_type = broken_test.error_type
+            
+            fixed = False
+            attempts = 0
+            start_time = time.time()
+            
+            while not fixed and attempts < self.MAX_REPAIR_ATTEMPTS:
+                attempts += 1
+                measurement.total_repair_attempts += 1
+                
+                if debug:
+                    print(f"    [DEBUG] Attempt {attempts}/{self.MAX_REPAIR_ATTEMPTS} to fix: {broken_test.test_name}")
+                
+                try:
+                    fixed_code = repair_function(current_code, current_error, current_error_type)
+                    
+                    is_valid, new_error, new_error_type = self._validate_java_fix(
+                        fixed_code, broken_test, test_dir, debug
+                    )
+                    
+                    if is_valid:
+                        fixed = True
+                        repair_time = time.time() - start_time
+                        measurement.total_repair_time_seconds += repair_time
+                        measurement.successful_repairs += 1
+                        measurement.successful_attempts += 1
+                        
+                        if attempts == 1:
+                            measurement.first_attempt_fixes += 1
+                        
+                        # Save fixed code
+                        test_file = Path(broken_test.file_path)
+                        test_file.write_text(fixed_code, encoding='utf-8')
+                        
+                        if debug:
+                            print(f"    [DEBUG] Fixed: {broken_test.test_name} (attempt {attempts})")
+                    else:
+                        # This attempt failed
+                        measurement.failed_attempts += 1
+                        current_code = fixed_code
+                        current_error = new_error
+                        current_error_type = new_error_type
+                        
+                except Exception as e:
+                    measurement.failed_attempts += 1
+                    if debug:
+                        print(f"    [DEBUG] Repair error: {e}")
+            
+            if not fixed:
+                measurement.failed_repairs += 1
+        
+        return measurement
+    
+    def _find_java_errors(self, test_dir: Path, debug: bool = False) -> list[BrokenTest]:
+        """Find Java compilation errors."""
+        broken_tests = []
+        
+        test_files = list(test_dir.glob("*Test.java"))
+        if not test_files:
+            return broken_tests
+        
+        junit_jar = test_dir / "lib" / "junit-platform-console-standalone.jar"
+        classpath = f"{junit_jar}{os.pathsep}." if junit_jar.exists() else "."
+        
+        for test_file in test_files:
+            result = subprocess.run(
+                ["javac", "-cp", classpath, str(test_file)],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir)
+            )
+            
+            if result.returncode != 0:
+                error_output = result.stderr
+                if debug:
+                    print(f"    [DEBUG] Compilation error in {test_file.name}: {error_output[:200]}")
+                
+                broken_tests.append(BrokenTest(
+                    file_path=str(test_file),
+                    test_name=test_file.name,
+                    code=test_file.read_text(encoding='utf-8'),
+                    error_type="compilation_error",
+                    error_message=error_output[:500]
+                ))
+        
+        return broken_tests
+    
+    def _validate_java_fix(
+        self,
+        fixed_code: str,
+        broken_test: BrokenTest,
+        test_dir: Path,
+        debug: bool = False
+    ) -> tuple[bool, str, str]:
+        """Validate Java fix by compiling."""
+        if not fixed_code or not fixed_code.strip():
+            return False, "Empty code", "empty_error"
+        
+        # Write to temp file and compile
+        temp_file = self.work_dir / f"temp_{broken_test.test_name}"
+        temp_file.write_text(fixed_code, encoding='utf-8')
+        
+        junit_jar = test_dir / "lib" / "junit-platform-console-standalone.jar"
+        classpath = f"{junit_jar}{os.pathsep}." if junit_jar.exists() else "."
+        
+        result = subprocess.run(
+            ["javac", "-cp", classpath, str(temp_file)],
+            capture_output=True,
+            text=True,
+            cwd=str(test_dir)
+        )
+        
+        if result.returncode == 0:
+            return True, "", ""
+        else:
+            return False, result.stderr[:500], "compilation_error"
+    
+    def measure_javascript(
+        self,
+        bot_name: str,
+        repair_function: Callable[[str, str, str], str],
+        test_dir: str,
+        source_dir: str,
+        project_name: str = "unnamed",
+        debug: bool = False
+    ) -> MaintenanceMeasurement:
+        """Measure test maintenance for JavaScript."""
+        measurement = MaintenanceMeasurement(
+            bot_name=bot_name,
+            language="javascript",
+            project_name=project_name
+        )
+        
+        test_dir = Path(test_dir)
+        source_dir = Path(source_dir)
+        
+        # Find syntax errors
+        broken_tests = self._find_javascript_errors(test_dir, debug)
+        
+        measurement.total_broken_tests = len(broken_tests)
+        
+        if not broken_tests:
+            if debug:
+                print("    [DEBUG] No broken JavaScript tests found")
+            return measurement
+        
+        print(f"    Found {len(broken_tests)} broken test(s)")
+        
+        # Try to fix each broken test
+        for broken_test in broken_tests:
+            current_code = broken_test.code
+            current_error = broken_test.error_message
+            current_error_type = broken_test.error_type
+            
+            fixed = False
+            attempts = 0
+            start_time = time.time()
+            
+            while not fixed and attempts < self.MAX_REPAIR_ATTEMPTS:
+                attempts += 1
+                measurement.total_repair_attempts += 1
+                
+                if debug:
+                    print(f"    [DEBUG] Attempt {attempts}/{self.MAX_REPAIR_ATTEMPTS} to fix: {broken_test.test_name}")
+                
+                try:
+                    fixed_code = repair_function(current_code, current_error, current_error_type)
+                    
+                    is_valid, new_error, new_error_type = self._validate_javascript_fix(
+                        fixed_code, broken_test, debug
+                    )
+                    
+                    if is_valid:
+                        fixed = True
+                        repair_time = time.time() - start_time
+                        measurement.total_repair_time_seconds += repair_time
+                        measurement.successful_repairs += 1
+                        measurement.successful_attempts += 1
+                        
+                        if attempts == 1:
+                            measurement.first_attempt_fixes += 1
+                        
+                        # Save fixed code
+                        test_file = Path(broken_test.file_path)
+                        test_file.write_text(fixed_code, encoding='utf-8')
+                        
+                        if debug:
+                            print(f"    [DEBUG] Fixed: {broken_test.test_name} (attempt {attempts})")
+                    else:
+                        # This attempt failed
+                        measurement.failed_attempts += 1
+                        current_code = fixed_code
+                        current_error = new_error
+                        current_error_type = new_error_type
+                        
+                except Exception as e:
+                    measurement.failed_attempts += 1
+                    if debug:
+                        print(f"    [DEBUG] Repair error: {e}")
+            
+            if not fixed:
+                measurement.failed_repairs += 1
+        
+        return measurement
+    
+    def _find_javascript_errors(self, test_dir: Path, debug: bool = False) -> list[BrokenTest]:
+        """Find JavaScript syntax errors."""
+        broken_tests = []
+        
+        test_files = list(test_dir.glob("*.test.js"))
+        test_files.extend(test_dir.glob("*.spec.js"))
+        
+        for test_file in test_files:
+            result = subprocess.run(
+                ["node", "--check", str(test_file)],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                error_output = result.stderr
+                if debug:
+                    print(f"    [DEBUG] Syntax error in {test_file.name}: {error_output[:200]}")
+                
+                broken_tests.append(BrokenTest(
+                    file_path=str(test_file),
+                    test_name=test_file.name,
+                    code=test_file.read_text(encoding='utf-8'),
+                    error_type="syntax_error",
+                    error_message=error_output[:500]
+                ))
+        
+        return broken_tests
+    
+    def _validate_javascript_fix(
+        self,
+        fixed_code: str,
+        broken_test: BrokenTest,
+        debug: bool = False
+    ) -> tuple[bool, str, str]:
+        """Validate JavaScript fix by checking syntax."""
+        if not fixed_code or not fixed_code.strip():
+            return False, "Empty code", "empty_error"
+        
+        # Write to temp file and check syntax
+        temp_file = self.work_dir / f"temp_{broken_test.test_name}"
+        temp_file.write_text(fixed_code, encoding='utf-8')
+        
+        result = subprocess.run(
+            ["node", "--check", str(temp_file)],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            return True, "", ""
+        else:
+            return False, result.stderr[:500], "syntax_error"
 
 
 if __name__ == "__main__":

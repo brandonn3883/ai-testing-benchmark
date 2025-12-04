@@ -401,6 +401,496 @@ class TestExecutionMeasurer:
                 print(f"    [DEBUG] pytest error: {e}")
         
         return results
+    
+    # Java mutation operators
+    JAVA_MUTATION_OPERATORS = [
+        # Arithmetic operators
+        (r'(\s)\+(\s)', r'\1-\2', 'arithmetic: + to -'),
+        (r'(\s)-(\s)', r'\1+\2', 'arithmetic: - to +'),
+        (r'(\s)\*(\s)', r'\1/\2', 'arithmetic: * to /'),
+        (r'(\s)/(\s)', r'\1*\2', 'arithmetic: / to *'),
+        
+        # Comparison operators
+        (r'==', r'!=', 'comparison: == to !='),
+        (r'!=', r'==', 'comparison: != to =='),
+        (r'<=', r'>', 'comparison: <= to >'),
+        (r'>=', r'<', 'comparison: >= to <'),
+        (r'(?<![<>!=])>', r'<', 'comparison: > to <'),
+        (r'(?<![<>!=])<', r'>', 'comparison: < to >'),
+        
+        # Logical operators
+        (r'&&', r'||', 'logical: && to ||'),
+        (r'\|\|', r'&&', 'logical: || to &&'),
+        (r'!(?!=)', r'', 'logical: remove !'),
+        
+        # Boolean literals
+        (r'\btrue\b', r'false', 'boolean: true to false'),
+        (r'\bfalse\b', r'true', 'boolean: false to true'),
+        
+        # Boundary mutations
+        (r'\b0\b', r'1', 'boundary: 0 to 1'),
+        (r'\b1\b', r'0', 'boundary: 1 to 0'),
+        
+        # Return value mutations
+        (r'return\s+(.+);', r'return null;', 'return: value to null'),
+    ]
+    
+    # JavaScript mutation operators
+    JS_MUTATION_OPERATORS = [
+        # Arithmetic operators
+        (r'(\s)\+(\s)', r'\1-\2', 'arithmetic: + to -'),
+        (r'(\s)-(\s)', r'\1+\2', 'arithmetic: - to +'),
+        (r'(\s)\*(\s)', r'\1/\2', 'arithmetic: * to /'),
+        (r'(\s)/(\s)', r'\1*\2', 'arithmetic: / to *'),
+        
+        # Comparison operators
+        (r'===', r'!==', 'comparison: === to !=='),
+        (r'!==', r'===', 'comparison: !== to ==='),
+        (r'==', r'!=', 'comparison: == to !='),
+        (r'!=', r'==', 'comparison: != to =='),
+        (r'<=', r'>', 'comparison: <= to >'),
+        (r'>=', r'<', 'comparison: >= to <'),
+        
+        # Logical operators
+        (r'&&', r'||', 'logical: && to ||'),
+        (r'\|\|', r'&&', 'logical: || to &&'),
+        (r'!(?!=)', r'', 'logical: remove !'),
+        
+        # Boolean literals
+        (r'\btrue\b', r'false', 'boolean: true to false'),
+        (r'\bfalse\b', r'true', 'boolean: false to true'),
+        
+        # Boundary mutations
+        (r'\b0\b', r'1', 'boundary: 0 to 1'),
+        (r'\b1\b', r'0', 'boundary: 1 to 0'),
+        
+        # Return value mutations
+        (r'return\s+(.+);', r'return null;', 'return: value to null'),
+    ]
+    
+    def measure_java(
+        self,
+        bot_name: str,
+        project_path: str,
+        test_path: str,
+        project_name: str = "unnamed",
+        max_mutants: int = 20,
+        debug: bool = False
+    ) -> ExecutionMeasurement:
+        """Measure Java test execution using mutation testing."""
+        measurement = ExecutionMeasurement(
+            bot_name=bot_name,
+            language="java",
+            project_name=project_name
+        )
+        
+        project_path = Path(project_path).resolve()
+        test_path = Path(test_path).resolve()
+        
+        # Check for compiled classes
+        if not list(test_path.glob("*.class")):
+            if debug:
+                print("    [DEBUG] No compiled Java classes found, skipping mutation testing")
+            return measurement
+        
+        # Run baseline tests
+        if debug:
+            print("    [DEBUG] Running baseline Java tests...")
+        
+        baseline = self._run_java_tests(test_path, debug)
+        measurement.total_test_cases = baseline["total"]
+        measurement.tests_passed = baseline["passed"]
+        measurement.tests_failed = baseline["failed"]
+        
+        if baseline["passed"] == 0:
+            if debug:
+                print("    [DEBUG] No passing tests, skipping mutation testing")
+            return measurement
+        
+        # Mutation testing
+        if debug:
+            print("    [DEBUG] Starting Java mutation testing...")
+        
+        source_files = [f for f in test_path.glob("*.java") if "Test" not in f.name]
+        
+        mutation_results = self._run_java_mutation_testing(
+            source_files, test_path, max_mutants, debug
+        )
+        
+        measurement.total_mutants = mutation_results["total"]
+        measurement.mutants_killed = mutation_results["killed"]
+        measurement.mutants_survived = mutation_results["survived"]
+        measurement.calculate_mutation_score()
+        
+        if debug:
+            print(f"    [DEBUG] Mutation score: {measurement.mutation_score:.1f}%")
+        
+        return measurement
+    
+    def _run_java_tests(self, test_dir: Path, debug: bool = False) -> dict:
+        """Run JUnit tests and return results."""
+        results = {"total": 0, "passed": 0, "failed": 0, "duration": 0.0}
+        
+        junit_jar = test_dir / "lib" / "junit-platform-console-standalone.jar"
+        if not junit_jar.exists():
+            return results
+        
+        try:
+            result = subprocess.run(
+                ["java", "-jar", str(junit_jar), "--class-path", ".", "--scan-class-path"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=120
+            )
+            
+            output = result.stdout
+            passed = re.search(r"(\d+) tests successful", output)
+            failed = re.search(r"(\d+) tests failed", output)
+            
+            results["passed"] = int(passed.group(1)) if passed else 0
+            results["failed"] = int(failed.group(1)) if failed else 0
+            results["total"] = results["passed"] + results["failed"]
+            
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Java test error: {e}")
+        
+        return results
+    
+    def _run_java_mutation_testing(
+        self,
+        source_files: list,
+        test_dir: Path,
+        max_mutants: int,
+        debug: bool
+    ) -> dict:
+        """Run mutation testing on Java source files."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        mutation_dir = self.work_dir / "mutations"
+        mutation_dir.mkdir(parents=True, exist_ok=True)
+        
+        for source_file in source_files:
+            code = source_file.read_text(encoding='utf-8')
+            mutants = self._generate_java_mutants(code, max_mutants - results["total"])
+            
+            for mutant_code, desc, line_num in mutants:
+                if results["total"] >= max_mutants:
+                    break
+                
+                results["total"] += 1
+                
+                if debug:
+                    print(f"    [DEBUG] Testing mutant {results['total']}: {desc} at line {line_num}")
+                
+                killed = self._test_java_mutant(source_file, mutant_code, test_dir, mutation_dir, debug)
+                
+                if killed:
+                    results["killed"] += 1
+                else:
+                    results["survived"] += 1
+        
+        return results
+    
+    def _generate_java_mutants(self, code: str, max_count: int) -> list:
+        """Generate Java mutants."""
+        mutants = []
+        lines = code.split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('//') or stripped.startswith('/*'):
+                continue
+            if stripped.startswith('import ') or stripped.startswith('package '):
+                continue
+            
+            for pattern, replacement, desc in self.JAVA_MUTATION_OPERATORS:
+                if len(mutants) >= max_count:
+                    return mutants
+                
+                if re.search(pattern, line):
+                    mutated_line = re.sub(pattern, replacement, line, count=1)
+                    if mutated_line != line:
+                        mutated_lines = lines.copy()
+                        mutated_lines[line_num - 1] = mutated_line
+                        mutants.append(('\n'.join(mutated_lines), desc, line_num))
+        
+        return mutants
+    
+    def _test_java_mutant(
+        self,
+        source_file: Path,
+        mutant_code: str,
+        test_dir: Path,
+        mutation_dir: Path,
+        debug: bool
+    ) -> bool:
+        """Test a Java mutant. Returns True if killed."""
+        # Clear mutation dir
+        for f in mutation_dir.glob("*"):
+            if f.is_file():
+                f.unlink()
+        
+        # Copy files
+        for f in test_dir.glob("*.java"):
+            shutil.copy(f, mutation_dir / f.name)
+        for f in test_dir.glob("*.class"):
+            shutil.copy(f, mutation_dir / f.name)
+        
+        # Copy lib directory
+        lib_src = test_dir / "lib"
+        lib_dst = mutation_dir / "lib"
+        if lib_src.exists() and not lib_dst.exists():
+            shutil.copytree(lib_src, lib_dst)
+        
+        # Write mutant
+        mutant_file = mutation_dir / source_file.name
+        mutant_file.write_text(mutant_code, encoding='utf-8')
+        
+        # Recompile
+        junit_jar = mutation_dir / "lib" / "junit-platform-console-standalone.jar"
+        compile_result = subprocess.run(
+            ["javac", "-cp", f"{junit_jar}{os.pathsep}.", str(mutant_file)],
+            capture_output=True,
+            cwd=str(mutation_dir),
+            timeout=30
+        )
+        
+        if compile_result.returncode != 0:
+            return True  # Compilation error = killed
+        
+        # Run tests
+        try:
+            result = subprocess.run(
+                ["java", "-jar", str(junit_jar), "--class-path", ".", "--scan-class-path"],
+                capture_output=True,
+                text=True,
+                cwd=str(mutation_dir),
+                timeout=30
+            )
+            return result.returncode != 0  # Tests failed = killed
+        except subprocess.TimeoutExpired:
+            return True
+        except Exception:
+            return True
+    
+    def measure_javascript(
+        self,
+        bot_name: str,
+        project_path: str,
+        test_path: str,
+        project_name: str = "unnamed",
+        max_mutants: int = 20,
+        debug: bool = False
+    ) -> ExecutionMeasurement:
+        """Measure JavaScript test execution using mutation testing."""
+        measurement = ExecutionMeasurement(
+            bot_name=bot_name,
+            language="javascript",
+            project_name=project_name
+        )
+        
+        project_path = Path(project_path).resolve()
+        test_path = Path(test_path).resolve()
+        
+        # Run baseline tests
+        if debug:
+            print("    [DEBUG] Running baseline JavaScript tests...")
+        
+        baseline = self._run_javascript_tests(test_path, debug)
+        measurement.total_test_cases = baseline["total"]
+        measurement.tests_passed = baseline["passed"]
+        measurement.tests_failed = baseline["failed"]
+        
+        if baseline["passed"] == 0:
+            if debug:
+                print("    [DEBUG] No passing tests, skipping mutation testing")
+            return measurement
+        
+        # Run manual mutation testing
+        if debug:
+            print("    [DEBUG] Starting JavaScript mutation testing...")
+        
+        source_files = [f for f in test_path.glob("*.js") 
+                       if ".test." not in f.name and ".spec." not in f.name 
+                       and "jest.config" not in f.name]
+        
+        mutation_results = self._run_manual_js_mutation_testing(
+            source_files, test_path, max_mutants, debug
+        )
+        
+        measurement.total_mutants = mutation_results["total"]
+        measurement.mutants_killed = mutation_results["killed"]
+        measurement.mutants_survived = mutation_results["survived"]
+        measurement.calculate_mutation_score()
+        
+        if debug:
+            print(f"    [DEBUG] Mutation score: {measurement.mutation_score:.1f}%")
+        
+        return measurement
+    
+    def _run_javascript_tests(self, test_dir: Path, debug: bool = False) -> dict:
+        """Run Jest tests and return results."""
+        results = {"total": 0, "passed": 0, "failed": 0, "duration": 0.0}
+        
+        # Determine correct command for Windows vs Unix
+        import platform
+        is_windows = platform.system() == "Windows"
+        npx_cmd = "npx.cmd" if is_windows else "npx"
+        
+        try:
+            result = subprocess.run(
+                [npx_cmd, "jest", "--no-colors", "--passWithNoTests"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=120,
+                shell=is_windows,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = (result.stdout or "") + (result.stderr or "")
+            
+            # Parse Jest output
+            passed = re.search(r"(\d+) passed", output)
+            failed = re.search(r"(\d+) failed", output)
+            
+            results["passed"] = int(passed.group(1)) if passed else 0
+            results["failed"] = int(failed.group(1)) if failed else 0
+            results["total"] = results["passed"] + results["failed"]
+            
+            if debug:
+                print(f"    [DEBUG] Jest results: {results}")
+            
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Jest error: {e}")
+        
+        return results
+    
+    def _run_manual_js_mutation_testing(
+        self,
+        source_files: list,
+        test_dir: Path,
+        max_mutants: int,
+        debug: bool
+    ) -> dict:
+        """Run manual mutation testing on JavaScript source files."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        mutation_dir = self.work_dir / "mutations"
+        mutation_dir.mkdir(parents=True, exist_ok=True)
+        
+        import platform
+        is_windows = platform.system() == "Windows"
+        npx_cmd = "npx.cmd" if is_windows else "npx"
+        
+        for source_file in source_files:
+            code = source_file.read_text(encoding='utf-8')
+            mutants = self._generate_javascript_mutants(code, max_mutants - results["total"])
+            
+            for mutant_code, desc, line_num in mutants:
+                if results["total"] >= max_mutants:
+                    break
+                
+                results["total"] += 1
+                
+                if debug:
+                    print(f"    [DEBUG] Testing mutant {results['total']}: {desc} at line {line_num}")
+                
+                killed = self._test_javascript_mutant(
+                    source_file, mutant_code, test_dir, mutation_dir, npx_cmd, is_windows, debug
+                )
+                
+                if killed:
+                    results["killed"] += 1
+                else:
+                    results["survived"] += 1
+        
+        return results
+    
+    def _generate_javascript_mutants(self, code: str, max_count: int) -> list:
+        """Generate JavaScript mutants."""
+        mutants = []
+        lines = code.split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('//') or stripped.startswith('/*'):
+                continue
+            if stripped.startswith('import ') or ('require' in stripped and 'const' in stripped):
+                continue
+            
+            for pattern, replacement, desc in self.JS_MUTATION_OPERATORS:
+                if len(mutants) >= max_count:
+                    return mutants
+                
+                if re.search(pattern, line):
+                    mutated_line = re.sub(pattern, replacement, line, count=1)
+                    if mutated_line != line:
+                        mutated_lines = lines.copy()
+                        mutated_lines[line_num - 1] = mutated_line
+                        mutants.append(('\n'.join(mutated_lines), desc, line_num))
+        
+        return mutants
+    
+    def _test_javascript_mutant(
+        self,
+        source_file: Path,
+        mutant_code: str,
+        test_dir: Path,
+        mutation_dir: Path,
+        npx_cmd: str,
+        is_windows: bool,
+        debug: bool
+    ) -> bool:
+        """Test a JavaScript mutant. Returns True if killed."""
+        # Clear mutation dir (except node_modules)
+        for f in mutation_dir.glob("*"):
+            if f.is_file():
+                f.unlink()
+            elif f.is_dir() and f.name not in ["node_modules", "coverage"]:
+                shutil.rmtree(f)
+        
+        # Copy files
+        for f in test_dir.glob("*.js"):
+            shutil.copy(f, mutation_dir / f.name)
+        
+        # Copy config files
+        for config in ["package.json", "jest.config.js"]:
+            src = test_dir / config
+            if src.exists():
+                shutil.copy(src, mutation_dir / config)
+        
+        # Copy node_modules if not exists
+        node_modules_src = test_dir / "node_modules"
+        node_modules_dst = mutation_dir / "node_modules"
+        if node_modules_src.exists() and not node_modules_dst.exists():
+            shutil.copytree(node_modules_src, node_modules_dst)
+        
+        # Write mutant
+        mutant_file = mutation_dir / source_file.name
+        mutant_file.write_text(mutant_code, encoding='utf-8')
+        
+        # Run tests
+        try:
+            result = subprocess.run(
+                [npx_cmd, "jest", "--no-colors", "--passWithNoTests"],
+                capture_output=True,
+                text=True,
+                cwd=str(mutation_dir),
+                timeout=30,
+                shell=is_windows,
+                encoding='utf-8',
+                errors='replace'
+            )
+            return result.returncode != 0  # Tests failed = killed
+        except subprocess.TimeoutExpired:
+            return True
+        except Exception:
+            return True
 
 
 if __name__ == "__main__":
