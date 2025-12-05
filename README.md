@@ -11,7 +11,7 @@ All bots get **identical prompts** for fair comparison.
 
 ```bash
 # Install dependencies
-pip install openai anthropic google-generativeai pytest pytest-cov --break-system-packages
+pip install python-dotenv openai anthropic google-generativeai pytest pytest-cov --break-system-packages
 
 # Set API keys in an .env file:
 OPENAI_API_KEY=
