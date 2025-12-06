@@ -58,6 +58,7 @@ REQUIREMENTS:
 4. Use descriptive test names that explain what is being tested
 5. Include meaningful assertions with clear expected values
 6. Each test should be independent and not rely on other tests{extra_instructions}
+7. Do not add ``` code blocks
 
 OUTPUT FORMAT:
 - Return ONLY valid, runnable test code
@@ -71,7 +72,7 @@ OUTPUT FORMAT:
         if language == "python" and module_name:
             import_instruction = f"\nIMPORTANT: Import the functions to test using: from {module_name} import *\n"
         elif language == "java" and module_name:
-            import_instruction = f"\nIMPORTANT: Do not include a package declaration and do not import any other libraries other than those from the source code and JUnit\n"
+            import_instruction = f"\nIMPORTANT: Do not include a package declaration and do not use mockito or import any other libraries other than those from the source code and JUnit\n"
         elif language == "javascript":
             if module_name:
                 import_instruction = f"""

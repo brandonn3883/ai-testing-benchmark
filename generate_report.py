@@ -48,13 +48,15 @@ class CSVReportGenerator:
             # Header
             writer.writerow([
                 "bot_name", "language", "project", "timestamp",
-                "test_coverage_pct", "mutation_score_pct", "mutants_killed", 
-                "mutants_survived", "errors_fixed_pct"
+                "test_coverage_pct", "tests_failed",
+                "mutation_score_pct", "mutants_killed", "mutants_survived", 
+                "errors_fixed_pct", "errors_remain"
             ])
             
             # Data rows
             for r in self.results:
                 coverage = r["creation"].line_coverage if r["creation"] else 0
+                tests_failed = r["creation"].tests_failed if r["creation"] else 0
                 
                 if r["execution"]:
                     mutation_score = r["execution"].mutation_score
@@ -69,12 +71,16 @@ class CSVReportGenerator:
                 if r["maintenance"]:
                     fixed_pct = r["maintenance"].get_fix_percentage()
                     fixed_pct_str = "N/A" if fixed_pct is None else str(round(fixed_pct, 2))
+                    errors_remain = r["maintenance"].errors_remain
                 else:
                     fixed_pct_str = "N/A"
+                    errors_remain = False
                 
                 writer.writerow([
                     r["bot_name"], r["language"], r["project_name"], r["timestamp"],
-                    round(coverage, 2), round(mutation_score, 2), killed, survived, fixed_pct_str
+                    round(coverage, 2), tests_failed,
+                    round(mutation_score, 2), killed, survived, 
+                    fixed_pct_str, errors_remain
                 ])
         
         return str(filepath)
@@ -88,7 +94,8 @@ class CSVReportGenerator:
             
             writer.writerow([
                 "bot_name", "language", "project",
-                "source_files", "tests_generated", "tests_compilable", "tests_passing",
+                "source_files", "tests_generated", "tests_compilable", 
+                "tests_passing", "tests_failed",
                 "line_coverage_pct", "branch_coverage_pct", "generation_time_sec"
             ])
             
@@ -97,7 +104,8 @@ class CSVReportGenerator:
                 if c:
                     writer.writerow([
                         r["bot_name"], r["language"], r["project_name"],
-                        c.source_files_count, c.tests_generated, c.tests_compilable, c.tests_passing,
+                        c.source_files_count, c.tests_generated, c.tests_compilable, 
+                        c.tests_passing, c.tests_failed,
                         round(c.line_coverage, 2), round(c.branch_coverage, 2),
                         round(c.generation_time_seconds, 2)
                     ])
@@ -141,7 +149,7 @@ class CSVReportGenerator:
             writer.writerow([
                 "bot_name", "language", "project",
                 "total_broken_tests", "successful_repairs", "failed_repairs",
-                "fix_percentage", "total_attempts", "first_attempt_fixes",
+                "errors_remain", "fix_percentage", "total_attempts", "first_attempt_fixes",
                 "efficiency_pct", "avg_attempts_per_fix", "total_repair_time_sec"
             ])
             
@@ -160,7 +168,7 @@ class CSVReportGenerator:
                     writer.writerow([
                         r["bot_name"], r["language"], r["project_name"],
                         m.total_broken_tests, m.successful_repairs, m.failed_repairs,
-                        fix_pct_str, m.total_repair_attempts, m.first_attempt_fixes,
+                        m.errors_remain, fix_pct_str, m.total_repair_attempts, m.first_attempt_fixes,
                         efficiency_str, avg_attempts_str,
                         round(m.total_repair_time_seconds, 2)
                     ])

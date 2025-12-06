@@ -121,7 +121,7 @@ class ChatGPTBot(BotInterface):
     def __init__(
         self, 
         api_key: str = None, 
-        model: str = "gpt-4o",
+        model: str = "gpt-4.1",
         temperature: float = 0.2,
         max_tokens: int = 4096,
         debug: bool = False
@@ -173,7 +173,7 @@ class ClaudeBot(BotInterface):
     def __init__(
         self, 
         api_key: str = None, 
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-5",
         temperature: float = 0.2,
         max_tokens: int = 4096,
         debug: bool = False

@@ -16,7 +16,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Callable
+from typing import Callable, Optional
 
 
 @dataclass
@@ -40,6 +40,7 @@ class MaintenanceMeasurement:
     total_broken_tests: int = 0           # Unique broken tests found
     successful_repairs: int = 0            # Tests successfully fixed
     failed_repairs: int = 0                # Tests that couldn't be fixed after all attempts
+    errors_remain: bool = False            # True if there are still unfixed errors
     
     # Attempt tracking (running totals)
     total_repair_attempts: int = 0         # Total API calls made (running total)
@@ -55,19 +56,19 @@ class MaintenanceMeasurement:
         if self.repair_details is None:
             self.repair_details = []
     
-    def get_fix_percentage(self) -> float | None:
+    def get_fix_percentage(self) -> Optional[float]:
         """Return percentage of errors fixed, or None if no errors."""
         if self.total_broken_tests == 0:
             return None  # N/A - no errors to fix
         return round((self.successful_repairs / self.total_broken_tests) * 100, 2)
     
-    def get_attempt_success_rate(self) -> float | None:
+    def get_attempt_success_rate(self) -> Optional[float]:
         """Return percentage of attempts that succeeded."""
         if self.total_repair_attempts == 0:
             return None
         return round((self.successful_attempts / self.total_repair_attempts) * 100, 2)
     
-    def get_efficiency_score(self) -> float | None:
+    def get_efficiency_score(self) -> Optional[float]:
         """
         Return efficiency score based on attempts needed.
         100% = all fixed on first attempt
@@ -79,7 +80,7 @@ class MaintenanceMeasurement:
         # Efficiency = first_attempt_fixes / successful_repairs * 100
         return round((self.first_attempt_fixes / self.successful_repairs) * 100, 2)
     
-    def get_avg_attempts_per_fix(self) -> float | None:
+    def get_avg_attempts_per_fix(self) -> Optional[float]:
         """Return average attempts needed per successful fix."""
         if self.successful_repairs == 0:
             return None
@@ -92,10 +93,14 @@ class MaintenanceMeasurement:
             return "N/A"
         return f"{pct:.1f}%"
     
+    def has_unfixed_errors(self) -> bool:
+        """Return True if there are still unfixed errors."""
+        return self.errors_remain or self.failed_repairs > 0
+    
     def to_dict(self) -> dict:
         return asdict(self)
     
-    def get_score(self) -> float | None:
+    def get_score(self) -> Optional[float]:
         """Return percentage of errors fixed, or None if no errors."""
         return self.get_fix_percentage()
 
@@ -246,7 +251,56 @@ class TestMaintenanceMeasurer:
                 if debug:
                     print(f"    [DEBUG] Failed to fix after {attempts} attempts: {broken_test.test_name}")
         
+        # Set errors_remain flag
+        measurement.errors_remain = measurement.failed_repairs > 0
+        
+        # Run final coverage after fixes
+        if measurement.successful_repairs > 0:
+            if debug:
+                print("    [DEBUG] Running final pytest to update coverage...")
+            self._run_python_final_coverage(test_dir, source_dir, debug)
+        
         return measurement
+    
+    def _run_python_final_coverage(self, test_dir: Path, source_dir: Path, debug: bool = False):
+        """Run final pytest with coverage after fixes."""
+        try:
+            # Copy source files to test dir if needed
+            for src_file in source_dir.glob("*.py"):
+                if not src_file.name.startswith("test_"):
+                    dest = test_dir / src_file.name
+                    if not dest.exists():
+                        shutil.copy(src_file, dest)
+            
+            result = subprocess.run(
+                ["python", "-m", "pytest", "--tb=short", "-v", 
+                 "--cov=.", "--cov-report=term-missing"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=120,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = (result.stdout or "") + (result.stderr or "")
+            
+            if debug:
+                # Parse test results
+                passed_match = re.search(r"(\d+) passed", output)
+                failed_match = re.search(r"(\d+) failed", output)
+                passed = int(passed_match.group(1)) if passed_match else 0
+                failed = int(failed_match.group(1)) if failed_match else 0
+                
+                # Parse coverage
+                cov_match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", output)
+                coverage = int(cov_match.group(1)) if cov_match else 0
+                
+                print(f"    [DEBUG] Final results: {passed} passed, {failed} failed, {coverage}% coverage")
+                
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Final coverage error: {e}")
     
     def _validate_and_get_error(
         self, 
@@ -654,6 +708,9 @@ class TestMaintenanceMeasurer:
                 if not fixed:
                     measurement.failed_repairs += 1
         
+        # Set errors_remain flag
+        measurement.errors_remain = measurement.failed_repairs > 0
+        
         # Run final test to update coverage
         if measurement.successful_repairs > 0:
             if debug:
@@ -695,7 +752,7 @@ class TestMaintenanceMeasurer:
                 print(f"    [DEBUG] Final test error: {e}")
     
     def _find_java_errors(self, test_dir: Path, debug: bool = False) -> list[BrokenTest]:
-        """Find Java test errors (not assertion failures) using Maven."""
+        """Find Java compilation/runtime errors (not assertion failures) using Maven."""
         broken_tests = []
         
         # Test files are in src/test/java for Maven projects
@@ -712,7 +769,60 @@ class TestMaintenanceMeasurer:
         is_windows = platform.system() == "Windows"
         mvn_cmd = "mvn.cmd" if is_windows else "mvn"
         
-        # Run tests with Maven to find errors (not failures)
+        # First check for compilation errors
+        try:
+            compile_result = subprocess.run(
+                [mvn_cmd, "test-compile", "-q"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=300,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            compile_output = (compile_result.stdout or "") + (compile_result.stderr or "")
+            
+            if "COMPILATION ERROR" in compile_output:
+                if debug:
+                    print("    [DEBUG] Found compilation error(s)")
+                
+                # Find which files have compilation errors
+                for test_file in test_files:
+                    if test_file.stem in compile_output or test_file.name in compile_output:
+                        if debug:
+                            print(f"    [DEBUG] Compilation error in {test_file.name}")
+                        
+                        broken_tests.append(BrokenTest(
+                            file_path=str(test_file),
+                            test_name=test_file.name,
+                            code=test_file.read_text(encoding='utf-8'),
+                            error_type="compilation_error",
+                            error_message=compile_output[-1500:]
+                        ))
+                
+                # If we found compilation errors, return them
+                if broken_tests:
+                    return broken_tests
+                    
+                # If compilation error but couldn't identify file, add all
+                for test_file in test_files:
+                    broken_tests.append(BrokenTest(
+                        file_path=str(test_file),
+                        test_name=test_file.name,
+                        code=test_file.read_text(encoding='utf-8'),
+                        error_type="compilation_error",
+                        error_message=compile_output[-1500:]
+                    ))
+                return broken_tests
+            
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Maven compile check error: {e}")
+        
+        # No compilation errors - check for runtime errors (not assertion failures)
+        # Runtime errors include: NoSuchMethodError, NoClassDefFoundError, NullPointerException in test setup, etc.
+        # We do NOT want to fix assertion failures like "expected: <X> but was: <Y>"
         try:
             result = subprocess.run(
                 [mvn_cmd, "test", "-q"],
@@ -726,70 +836,59 @@ class TestMaintenanceMeasurer:
             
             output = (result.stdout or "") + (result.stderr or "")
             
-            # Check for Errors (compilation/runtime errors), NOT Failures (assertion failures)
-            # Example: Tests run: 29, Failures: 15, Errors: 3, Skipped: 0
-            errors_match = re.search(r"Errors:\s*(\d+)", output)
-            num_errors = int(errors_match.group(1)) if errors_match else 0
+            # Look for actual runtime errors (not assertion failures)
+            # These are real errors that need fixing:
+            runtime_error_patterns = [
+                r'java\.lang\.NoSuchMethodError',
+                r'java\.lang\.NoClassDefFoundError', 
+                r'java\.lang\.ClassNotFoundException',
+                r'java\.lang\.NoSuchFieldError',
+                r'java\.lang\.IllegalAccessError',
+                r'java\.lang\.IncompatibleClassChangeError',
+                r'java\.lang\.InstantiationError',
+                r'java\.lang\.LinkageError',
+                r'java\.lang\.VerifyError',
+                r'Unresolved compilation problem',
+                r'cannot find symbol',
+                r'method .+ in class .+ cannot be applied to given types',
+            ]
             
-            has_compilation_error = "COMPILATION ERROR" in output
+            has_runtime_error = any(re.search(pattern, output) for pattern in runtime_error_patterns)
             
-            if num_errors > 0 or has_compilation_error:
+            if has_runtime_error:
                 if debug:
-                    print(f"    [DEBUG] Found {num_errors} error(s), compilation_error={has_compilation_error}")
+                    print("    [DEBUG] Found runtime error(s) that need fixing")
                 
-                # Try multiple patterns to find which test files have errors
-                error_files = set()
-                
-                # Pattern 1: [ERROR]   SlugifyTest.shouldHandle:225
-                pattern1 = re.compile(r'\[ERROR\]\s+(\w+Test)\.')
-                for match in pattern1.findall(output):
-                    error_files.add(f"{match}.java")
-                
-                # Pattern 2: SlugifyTest.java:[line,col] error:
-                pattern2 = re.compile(r'(\w+Test)\.java:\[?\d+')
-                for match in pattern2.findall(output):
-                    error_files.add(f"{match}.java")
-                
-                # Pattern 3: Look for test class names mentioned near "error" or "Error"
                 for test_file in test_files:
-                    if test_file.stem in output:
-                        # Check if it's near an error mention
-                        stem = test_file.stem
-                        if re.search(rf'{stem}.*(?:error|Error|ERROR)', output) or \
-                           re.search(rf'(?:error|Error|ERROR).*{stem}', output):
-                            error_files.add(test_file.name)
+                    if test_file.stem in output or test_file.name in output:
+                        broken_tests.append(BrokenTest(
+                            file_path=str(test_file),
+                            test_name=test_file.name,
+                            code=test_file.read_text(encoding='utf-8'),
+                            error_type="runtime_error",
+                            error_message=output[-1500:]
+                        ))
                 
-                if debug:
-                    print(f"    [DEBUG] Error files found: {error_files}")
-                
-                # If we found specific files with errors, add those
-                if error_files:
-                    for test_file in test_files:
-                        if test_file.name in error_files:
-                            if debug:
-                                print(f"    [DEBUG] Adding broken test: {test_file.name}")
-                            
-                            broken_tests.append(BrokenTest(
-                                file_path=str(test_file),
-                                test_name=test_file.name,
-                                code=test_file.read_text(encoding='utf-8'),
-                                error_type="compilation_error" if has_compilation_error else "test_error",
-                                error_message=output[-1500:]  # Last part has error details
-                            ))
-                else:
-                    # Couldn't identify specific file - if there are errors, add all test files
-                    if debug:
-                        print(f"    [DEBUG] Couldn't identify specific error files, adding all {len(test_files)} test file(s)")
-                    
+                # If we couldn't identify specific files, add all
+                if not broken_tests and has_runtime_error:
                     for test_file in test_files:
                         broken_tests.append(BrokenTest(
                             file_path=str(test_file),
                             test_name=test_file.name,
                             code=test_file.read_text(encoding='utf-8'),
-                            error_type="compilation_error" if has_compilation_error else "test_error",
+                            error_type="runtime_error", 
                             error_message=output[-1500:]
                         ))
-                            
+            elif debug:
+                # Check if there are just assertion failures (which we ignore)
+                failures_match = re.search(r"Failures:\s*(\d+)", output)
+                errors_match = re.search(r"Errors:\s*(\d+)", output)
+                failures = int(failures_match.group(1)) if failures_match else 0
+                errors = int(errors_match.group(1)) if errors_match else 0
+                
+                if failures > 0 or errors > 0:
+                    print(f"    [DEBUG] {failures} assertion failures, {errors} errors (assertion failures are expected, not fixing)")
+                    
         except Exception as e:
             if debug:
                 print(f"    [DEBUG] Maven test error: {e}")
@@ -942,6 +1041,9 @@ class TestMaintenanceMeasurer:
             
             if not fixed:
                 measurement.failed_repairs += 1
+        
+        # Set errors_remain flag
+        measurement.errors_remain = measurement.failed_repairs > 0
         
         return measurement
     

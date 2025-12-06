@@ -188,6 +188,18 @@ class BenchmarkRunner:
                                 avg = m.get_avg_attempts_per_fix()
                                 if avg:
                                     print(f"    Avg attempts per fix: {avg:.1f}")
+                                
+                                # Re-analyze coverage after fixes
+                                if verbose:
+                                    print("    Re-analyzing coverage after fixes...")
+                                new_coverage = self._reanalyze_coverage(
+                                    language, generated_test_dir, project_path, debug
+                                )
+                                if new_coverage is not None and result["creation"]:
+                                    old_coverage = result["creation"].line_coverage
+                                    result["creation"].line_coverage = new_coverage
+                                    if verbose:
+                                        print(f"    Coverage: {old_coverage:.1f}% -> {new_coverage:.1f}%")
                 else:
                     if verbose:
                         print("    Skipped (no generated tests)")
@@ -273,6 +285,137 @@ class BenchmarkRunner:
         )
         
         return result
+    
+    def _reanalyze_coverage(
+        self,
+        language: str,
+        test_dir: Path,
+        source_dir: str,
+        debug: bool = False
+    ) -> float:
+        """Re-analyze coverage after maintenance fixes."""
+        import subprocess
+        import re
+        import platform
+        import shutil
+        
+        try:
+            if language == "python":
+                # Run pytest with coverage
+                result = subprocess.run(
+                    ["python", "-m", "pytest", "--cov=.", "--cov-report=term-missing", "-q"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=120,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                
+                # Parse coverage: TOTAL ... XX%
+                cov_match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", output)
+                coverage_value = float(cov_match.group(1)) if cov_match else None
+                
+                # Cleanup coverage files
+                coverage_file = test_dir / ".coverage"
+                if coverage_file.exists():
+                    coverage_file.unlink()
+                htmlcov_dir = test_dir / "htmlcov"
+                if htmlcov_dir.exists():
+                    shutil.rmtree(htmlcov_dir, ignore_errors=True)
+                
+                return coverage_value
+                    
+            elif language == "java":
+                # Run Maven test (JaCoCo will update coverage)
+                is_windows = platform.system() == "Windows"
+                mvn_cmd = "mvn.cmd" if is_windows else "mvn"
+                
+                result = subprocess.run(
+                    [mvn_cmd, "test", "-q"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=300,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                
+                coverage_value = None
+                
+                # Parse JaCoCo CSV report
+                coverage_csv = test_dir / "target" / "site" / "jacoco" / "jacoco.csv"
+                if coverage_csv.exists():
+                    coverage_data = coverage_csv.read_text(encoding='utf-8')
+                    lines = coverage_data.strip().split('\n')
+                    if len(lines) > 1:
+                        total_covered = 0
+                        total_missed = 0
+                        for line in lines[1:]:
+                            parts = line.split(',')
+                            if len(parts) >= 9:
+                                try:
+                                    missed = int(parts[7])
+                                    covered = int(parts[8])
+                                    total_missed += missed
+                                    total_covered += covered
+                                except (ValueError, IndexError):
+                                    pass
+                        
+                        total = total_covered + total_missed
+                        if total > 0:
+                            coverage_value = (total_covered / total) * 100
+                    
+                    # Cleanup JaCoCo files
+                    coverage_csv.unlink()
+                
+                # Also cleanup jacoco.exec
+                jacoco_exec = test_dir / "target" / "jacoco.exec"
+                if jacoco_exec.exists():
+                    jacoco_exec.unlink()
+                
+                return coverage_value
+                            
+            elif language == "javascript":
+                # Run Jest with coverage
+                is_windows = platform.system() == "Windows"
+                npx_cmd = "npx.cmd" if is_windows else "npx"
+                
+                result = subprocess.run(
+                    [npx_cmd, "jest", "--coverage", "--coverageReporters=json-summary", "-silent"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=120,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                
+                coverage_value = None
+                
+                # Parse coverage-summary.json
+                import json
+                coverage_file = test_dir / "coverage" / "coverage-summary.json"
+                if coverage_file.exists():
+                    data = json.loads(coverage_file.read_text(encoding='utf-8'))
+                    lines = data.get("total", {}).get("lines", {})
+                    pct = lines.get("pct", 0)
+                    if isinstance(pct, (int, float)):
+                        coverage_value = float(pct)
+                
+                # Cleanup coverage directory
+                coverage_dir = test_dir / "coverage"
+                if coverage_dir.exists():
+                    shutil.rmtree(coverage_dir, ignore_errors=True)
+                
+                return coverage_value
+                        
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Coverage re-analysis error: {e}")
+        
+        return None
     
     def run_all_bots(
         self,

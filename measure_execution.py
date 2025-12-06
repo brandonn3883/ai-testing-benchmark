@@ -244,8 +244,10 @@ class TestExecutionMeasurer:
         return results
     
     def _generate_mutants(self, code: str, max_count: int) -> list:
-        """Generate mutants from source code."""
-        mutants = []
+        """Generate mutants from source code with randomization for variety."""
+        import random
+        
+        all_mutants = []
         lines = code.split('\n')
         
         for line_num, line in enumerate(lines, 1):
@@ -260,9 +262,6 @@ class TestExecutionMeasurer:
             
             # Try each mutation operator
             for pattern, replacement, desc in self.MUTATION_OPERATORS:
-                if len(mutants) >= max_count:
-                    return mutants
-                
                 if re.search(pattern, line):
                     # Create mutated line
                     mutated_line = re.sub(pattern, replacement, line, count=1)
@@ -276,11 +275,13 @@ class TestExecutionMeasurer:
                         # Verify it's valid Python
                         try:
                             compile(mutated_code, '<string>', 'exec')
-                            mutants.append((mutated_code, desc, line_num))
+                            all_mutants.append((mutated_code, desc, line_num))
                         except SyntaxError:
                             pass  # Invalid mutation, skip
         
-        return mutants
+        # Shuffle to get variety, then take max_count
+        random.shuffle(all_mutants)
+        return all_mutants[:max_count]
     
     def _test_mutant(
         self, 
@@ -402,40 +403,7 @@ class TestExecutionMeasurer:
         
         return results
     
-    # Java mutation operators
-    JAVA_MUTATION_OPERATORS = [
-        # Arithmetic operators
-        (r'(\s)\+(\s)', r'\1-\2', 'arithmetic: + to -'),
-        (r'(\s)-(\s)', r'\1+\2', 'arithmetic: - to +'),
-        (r'(\s)\*(\s)', r'\1/\2', 'arithmetic: * to /'),
-        (r'(\s)/(\s)', r'\1*\2', 'arithmetic: / to *'),
-        
-        # Comparison operators
-        (r'==', r'!=', 'comparison: == to !='),
-        (r'!=', r'==', 'comparison: != to =='),
-        (r'<=', r'>', 'comparison: <= to >'),
-        (r'>=', r'<', 'comparison: >= to <'),
-        (r'(?<![<>!=])>', r'<', 'comparison: > to <'),
-        (r'(?<![<>!=])<', r'>', 'comparison: < to >'),
-        
-        # Logical operators
-        (r'&&', r'||', 'logical: && to ||'),
-        (r'\|\|', r'&&', 'logical: || to &&'),
-        (r'!(?!=)', r'', 'logical: remove !'),
-        
-        # Boolean literals
-        (r'\btrue\b', r'false', 'boolean: true to false'),
-        (r'\bfalse\b', r'true', 'boolean: false to true'),
-        
-        # Boundary mutations
-        (r'\b0\b', r'1', 'boundary: 0 to 1'),
-        (r'\b1\b', r'0', 'boundary: 1 to 0'),
-        
-        # Return value mutations
-        (r'return\s+(.+);', r'return null;', 'return: value to null'),
-    ]
-    
-    # JavaScript mutation operators
+    # JavaScript mutation operators (still needed for manual JS mutation testing)
     JS_MUTATION_OPERATORS = [
         # Arithmetic operators
         (r'(\s)\+(\s)', r'\1-\2', 'arithmetic: + to -'),
@@ -477,7 +445,7 @@ class TestExecutionMeasurer:
         max_mutants: int = 20,
         debug: bool = False
     ) -> ExecutionMeasurement:
-        """Measure Java test execution using mutation testing."""
+        """Measure Java test execution using PITest mutation testing."""
         measurement = ExecutionMeasurement(
             bot_name=bot_name,
             language="java",
@@ -498,6 +466,9 @@ class TestExecutionMeasurer:
                 print("    [DEBUG] No pom.xml found, skipping Java mutation testing")
             return measurement
         
+        # Add PITest plugin to pom.xml if not present
+        self._ensure_pitest_plugin(pom_file, debug)
+        
         # Run baseline tests with Maven
         if debug:
             print("    [DEBUG] Running baseline Java tests...")
@@ -512,22 +483,11 @@ class TestExecutionMeasurer:
                 print("    [DEBUG] No passing tests, skipping mutation testing")
             return measurement
         
-        # Mutation testing
+        # Run PITest mutation testing
         if debug:
-            print("    [DEBUG] Starting Java mutation testing...")
+            print("    [DEBUG] Running PITest mutation testing...")
         
-        # Find source files in src/main/java
-        main_java = test_path / "src" / "main" / "java"
-        source_files = list(main_java.glob("*.java")) if main_java.exists() else []
-        
-        if not source_files:
-            if debug:
-                print("    [DEBUG] No source files found for mutation")
-            return measurement
-        
-        mutation_results = self._run_java_mutation_testing(
-            source_files, test_path, mvn_cmd, is_windows, max_mutants, debug
-        )
+        mutation_results = self._run_pitest(test_path, mvn_cmd, is_windows, debug)
         
         measurement.total_mutants = mutation_results["total"]
         measurement.mutants_killed = mutation_results["killed"]
@@ -538,6 +498,192 @@ class TestExecutionMeasurer:
             print(f"    [DEBUG] Mutation score: {measurement.mutation_score:.1f}%")
         
         return measurement
+    
+    def _ensure_pitest_plugin(self, pom_file: Path, debug: bool = False):
+        """Add PITest plugin to pom.xml if not already present."""
+        content = pom_file.read_text(encoding='utf-8')
+        
+        if 'pitest-maven' in content:
+            if debug:
+                print("    [DEBUG] PITest plugin already in pom.xml")
+            return
+        
+        if debug:
+            print("    [DEBUG] Adding PITest plugin to pom.xml")
+        
+        # Find source class names from src/main/java
+        main_java = pom_file.parent / "src" / "main" / "java"
+        source_classes = []
+        if main_java.exists():
+            for java_file in main_java.glob("*.java"):
+                # Get class name from file
+                class_name = java_file.stem
+                source_classes.append(class_name)
+        
+        if not source_classes:
+            source_classes = ["*"]  # Fallback, but this might cause issues
+        
+        # Build targetClasses XML
+        target_classes_xml = '\n'.join(f'                        <param>{cls}</param>' for cls in source_classes)
+        
+        pitest_plugin = f'''
+            <!-- PITest mutation testing plugin -->
+            <plugin>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-maven</artifactId>
+                <version>1.15.0</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-junit5-plugin</artifactId>
+                        <version>1.2.1</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <targetClasses>
+{target_classes_xml}
+                    </targetClasses>
+                    <targetTests>
+                        <param>*Test</param>
+                    </targetTests>
+                    <outputFormats>
+                        <outputFormat>CSV</outputFormat>
+                        <outputFormat>HTML</outputFormat>
+                    </outputFormats>
+                    <timestampedReports>false</timestampedReports>
+                    <failWhenNoMutations>false</failWhenNoMutations>
+                </configuration>
+            </plugin>
+'''
+        
+        if debug:
+            print(f"    [DEBUG] Target classes: {source_classes}")
+        
+        # Insert before </plugins>
+        if '</plugins>' in content:
+            content = content.replace('</plugins>', pitest_plugin + '        </plugins>')
+            pom_file.write_text(content, encoding='utf-8')
+        elif '</build>' in content:
+            # No plugins section, add one
+            plugins_section = f'''    <plugins>
+{pitest_plugin}
+        </plugins>
+    '''
+            content = content.replace('</build>', plugins_section + '</build>')
+            pom_file.write_text(content, encoding='utf-8')
+    
+    def _run_pitest(self, test_dir: Path, mvn_cmd: str, is_windows: bool, debug: bool = False) -> dict:
+        """Run PITest mutation testing and return results."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        try:
+            # Run PITest
+            result = subprocess.run(
+                [mvn_cmd, "org.pitest:pitest-maven:mutationCoverage", "-q"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=600,  # 10 minute timeout for mutation testing
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = (result.stdout or "") + (result.stderr or "")
+            
+            if debug:
+                print(f"    [DEBUG] PITest output (last 1000 chars): {output[-1000:]}")
+            
+            # Parse results from CSV report
+            # PITest creates reports in target/pit-reports/
+            pit_reports = test_dir / "target" / "pit-reports"
+            
+            # Find the mutations.csv file
+            csv_file = pit_reports / "mutations.csv"
+            if csv_file.exists():
+                results = self._parse_pitest_csv(csv_file, debug)
+            else:
+                # Try to find in subdirectory (timestamped reports)
+                for subdir in pit_reports.glob("*"):
+                    if subdir.is_dir():
+                        csv_file = subdir / "mutations.csv"
+                        if csv_file.exists():
+                            results = self._parse_pitest_csv(csv_file, debug)
+                            break
+            
+            # If CSV not found, try parsing from console output
+            if results["total"] == 0:
+                results = self._parse_pitest_output(output, debug)
+                
+        except subprocess.TimeoutExpired:
+            if debug:
+                print("    [DEBUG] PITest timed out")
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] PITest error: {e}")
+        
+        return results
+    
+    def _parse_pitest_csv(self, csv_file: Path, debug: bool = False) -> dict:
+        """Parse PITest mutations.csv report."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        try:
+            content = csv_file.read_text(encoding='utf-8')
+            lines = content.strip().split('\n')
+            
+            for line in lines[1:]:  # Skip header
+                results["total"] += 1
+                # CSV format: file,class,mutator,method,line,status,killingTest
+                parts = line.split(',')
+                if len(parts) >= 6:
+                    status = parts[5].strip().upper()
+                    if status in ['KILLED', 'TIMED_OUT']:
+                        results["killed"] += 1
+                    elif status in ['SURVIVED', 'NO_COVERAGE']:
+                        results["survived"] += 1
+            
+            if debug:
+                print(f"    [DEBUG] PITest CSV results: {results}")
+                
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Error parsing PITest CSV: {e}")
+        
+        return results
+    
+    def _parse_pitest_output(self, output: str, debug: bool = False) -> dict:
+        """Parse PITest results from console output."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        # Look for summary line like:
+        # >> Generated 45 mutations Killed 38 (84%)
+        # or: mutations: 45, killed: 38
+        
+        generated_match = re.search(r'Generated\s+(\d+)\s+mutations', output)
+        killed_match = re.search(r'Killed\s+(\d+)', output)
+        
+        if generated_match:
+            results["total"] = int(generated_match.group(1))
+        if killed_match:
+            results["killed"] = int(killed_match.group(1))
+        
+        results["survived"] = results["total"] - results["killed"]
+        
+        # Alternative pattern
+        if results["total"] == 0:
+            alt_match = re.search(r'(\d+)\s+mutations?\s+(?:were\s+)?(?:generated|created)', output, re.IGNORECASE)
+            if alt_match:
+                results["total"] = int(alt_match.group(1))
+            
+            killed_alt = re.search(r'(\d+)\s+(?:mutations?\s+)?killed', output, re.IGNORECASE)
+            if killed_alt:
+                results["killed"] = int(killed_alt.group(1))
+                results["survived"] = results["total"] - results["killed"]
+        
+        if debug:
+            print(f"    [DEBUG] PITest parsed from output: {results}")
+        
+        return results
     
     def _run_java_tests_maven(self, test_dir: Path, mvn_cmd: str, is_windows: bool, debug: bool = False) -> dict:
         """Run Maven tests and return results."""
@@ -574,135 +720,6 @@ class TestExecutionMeasurer:
                 print(f"    [DEBUG] Maven test error: {e}")
         
         return results
-    
-    def _run_java_mutation_testing(
-        self,
-        source_files: list,
-        test_dir: Path,
-        mvn_cmd: str,
-        is_windows: bool,
-        max_mutants: int,
-        debug: bool
-    ) -> dict:
-        """Run mutation testing on Java source files using Maven."""
-        results = {"total": 0, "killed": 0, "survived": 0}
-        
-        mutation_dir = self.work_dir / "mutations"
-        
-        # Get baseline failure count to compare against
-        baseline = self._run_java_tests_maven(test_dir, mvn_cmd, is_windows, False)
-        baseline_failed = baseline["failed"]
-        
-        if debug:
-            print(f"    [DEBUG] Baseline: {baseline['passed']} passed, {baseline_failed} failed")
-        
-        for source_file in source_files:
-            code = source_file.read_text(encoding='utf-8')
-            mutants = self._generate_java_mutants(code, max_mutants - results["total"])
-            
-            for mutant_code, desc, line_num in mutants:
-                if results["total"] >= max_mutants:
-                    break
-                
-                results["total"] += 1
-                
-                if debug:
-                    print(f"    [DEBUG] Testing mutant {results['total']}: {desc} at line {line_num}")
-                
-                killed = self._test_java_mutant_maven(
-                    source_file, mutant_code, test_dir, mutation_dir, 
-                    mvn_cmd, is_windows, baseline_failed, debug
-                )
-                
-                if killed:
-                    results["killed"] += 1
-                else:
-                    results["survived"] += 1
-        
-        return results
-    
-    def _generate_java_mutants(self, code: str, max_count: int) -> list:
-        """Generate Java mutants."""
-        mutants = []
-        lines = code.split('\n')
-        
-        for line_num, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith('//') or stripped.startswith('/*'):
-                continue
-            if stripped.startswith('import ') or stripped.startswith('package '):
-                continue
-            
-            for pattern, replacement, desc in self.JAVA_MUTATION_OPERATORS:
-                if len(mutants) >= max_count:
-                    return mutants
-                
-                if re.search(pattern, line):
-                    mutated_line = re.sub(pattern, replacement, line, count=1)
-                    if mutated_line != line:
-                        mutated_lines = lines.copy()
-                        mutated_lines[line_num - 1] = mutated_line
-                        mutants.append(('\n'.join(mutated_lines), desc, line_num))
-        
-        return mutants
-    
-    def _test_java_mutant_maven(
-        self,
-        source_file: Path,
-        mutant_code: str,
-        test_dir: Path,
-        mutation_dir: Path,
-        mvn_cmd: str,
-        is_windows: bool,
-        baseline_failed: int,
-        debug: bool
-    ) -> bool:
-        """Test a Java mutant using Maven. Returns True if killed."""
-        # Copy entire Maven project to mutation dir
-        if mutation_dir.exists():
-            shutil.rmtree(mutation_dir)
-        shutil.copytree(test_dir, mutation_dir, ignore=shutil.ignore_patterns('target'))
-        
-        # Write mutant to src/main/java
-        main_java = mutation_dir / "src" / "main" / "java"
-        mutant_file = main_java / source_file.name
-        mutant_file.write_text(mutant_code, encoding='utf-8')
-        
-        # Run Maven test
-        try:
-            result = subprocess.run(
-                [mvn_cmd, "test", "-q"],
-                capture_output=True,
-                text=True,
-                cwd=str(mutation_dir),
-                timeout=120,
-                encoding='utf-8',
-                errors='replace'
-            )
-            
-            output = (result.stdout or "") + (result.stderr or "")
-            
-            # Check for compilation failure
-            if "COMPILATION ERROR" in output:
-                return True  # Compilation error = killed
-            
-            # Parse test results: Tests run: X, Failures: Y, Errors: Z
-            tests_match = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)", output)
-            if tests_match:
-                failures = int(tests_match.group(2))
-                errors = int(tests_match.group(3))
-                mutant_failed = failures + errors
-                
-                # Mutant is killed if it causes MORE failures than baseline
-                return mutant_failed > baseline_failed
-            
-            # If we can't parse, check return code as fallback
-            return result.returncode != 0
-            
-        except subprocess.TimeoutExpired:
-            return True  # Timeout = killed
-        except Exception:
-            return True  # Error = killed
     
     def measure_javascript(
         self,
@@ -841,8 +858,10 @@ class TestExecutionMeasurer:
         return results
     
     def _generate_javascript_mutants(self, code: str, max_count: int) -> list:
-        """Generate JavaScript mutants."""
-        mutants = []
+        """Generate JavaScript mutants with randomization for variety."""
+        import random
+        
+        all_mutants = []
         lines = code.split('\n')
         
         for line_num, line in enumerate(lines, 1):
@@ -853,17 +872,16 @@ class TestExecutionMeasurer:
                 continue
             
             for pattern, replacement, desc in self.JS_MUTATION_OPERATORS:
-                if len(mutants) >= max_count:
-                    return mutants
-                
                 if re.search(pattern, line):
                     mutated_line = re.sub(pattern, replacement, line, count=1)
                     if mutated_line != line:
                         mutated_lines = lines.copy()
                         mutated_lines[line_num - 1] = mutated_line
-                        mutants.append(('\n'.join(mutated_lines), desc, line_num))
+                        all_mutants.append(('\n'.join(mutated_lines), desc, line_num))
         
-        return mutants
+        # Shuffle to get variety, then take max_count
+        random.shuffle(all_mutants)
+        return all_mutants[:max_count]
     
     def _test_javascript_mutant(
         self,

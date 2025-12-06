@@ -45,6 +45,7 @@ class CreationMeasurement:
     # Supporting info
     tests_compilable: int = 0
     tests_passing: int = 0
+    tests_failed: int = 0  # Track failing tests
     compilation_errors: list = None
     
     def __post_init__(self):
@@ -303,6 +304,9 @@ class TestCreationMeasurer:
             error = re.search(r"(\d+) error", output)
             
             measurement.tests_passing = int(passed.group(1)) if passed else 0
+            failed_count = int(failed.group(1)) if failed else 0
+            error_count = int(error.group(1)) if error else 0
+            measurement.tests_failed = failed_count + error_count
             
             # Parse coverage from terminal output as backup
             # Look for pattern like "TOTAL    100     20    80%"
@@ -324,9 +328,20 @@ class TestCreationMeasurer:
                         measurement.line_coverage = totals.get("percent_covered", 0.0)
                     if totals.get("percent_covered_branches"):
                         measurement.branch_coverage = totals.get("percent_covered_branches", 0.0)
+                
+                # Cleanup coverage files
+                coverage_file.unlink()
             else:
                 if debug:
                     print(f"    [DEBUG] coverage.json not found at {coverage_file}")
+            
+            # Cleanup other coverage files
+            dotcoverage = test_dir / ".coverage"
+            if dotcoverage.exists():
+                dotcoverage.unlink()
+            htmlcov_dir = test_dir / "htmlcov"
+            if htmlcov_dir.exists():
+                shutil.rmtree(htmlcov_dir, ignore_errors=True)
                         
         except subprocess.TimeoutExpired:
             print("    Warning: Coverage timed out")
@@ -456,9 +471,10 @@ class TestCreationMeasurer:
     <packaging>jar</packaging>
 
     <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <lombok.version>1.18.36</lombok.version>
     </properties>
 
     <dependencies>
@@ -470,11 +486,11 @@ class TestCreationMeasurer:
             <scope>test</scope>
         </dependency>
         
-        <!-- Lombok -->
+        <!-- Lombok - using edge version for newer Java support -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
-            <version>1.18.30</version>
+            <version>${lombok.version}</version>
             <scope>provided</scope>
         </dependency>
         
@@ -492,15 +508,16 @@ class TestCreationMeasurer:
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
+                <version>3.13.0</version>
                 <configuration>
-                    <source>11</source>
-                    <target>11</target>
+                    <source>17</source>
+                    <target>17</target>
+                    <release>17</release>
                     <annotationProcessorPaths>
                         <path>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
-                            <version>1.18.30</version>
+                            <version>${lombok.version}</version>
                         </path>
                     </annotationProcessorPaths>
                 </configuration>
@@ -520,7 +537,7 @@ class TestCreationMeasurer:
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
-                <version>0.8.11</version>
+                <version>0.8.12</version>
                 <executions>
                     <execution>
                         <goals>
@@ -599,6 +616,7 @@ class TestCreationMeasurer:
                 failures = int(tests_match.group(2))
                 errors = int(tests_match.group(3))
                 measurement.tests_passing = total - failures - errors
+                measurement.tests_failed = failures + errors
             
             # Parse coverage from JaCoCo CSV report
             coverage_csv = test_dir / "target" / "site" / "jacoco" / "jacoco.csv"
@@ -642,6 +660,15 @@ class TestCreationMeasurer:
                     measurement.line_coverage = (total_covered / total) * 100
                     if debug:
                         print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+            
+            # Cleanup coverage files
+            csv_path.unlink()
+            
+            # Also cleanup jacoco.exec
+            jacoco_exec = csv_path.parent.parent.parent / "jacoco.exec"
+            if jacoco_exec.exists():
+                jacoco_exec.unlink()
+                
         except Exception as e:
             if debug:
                 print(f"    [DEBUG] Error parsing coverage CSV: {e}")
@@ -663,6 +690,15 @@ class TestCreationMeasurer:
                     if debug:
                         print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
                     break
+            
+            # Cleanup coverage files
+            xml_path.unlink()
+            
+            # Also cleanup jacoco.exec
+            jacoco_exec = xml_path.parent.parent.parent / "jacoco.exec"
+            if jacoco_exec.exists():
+                jacoco_exec.unlink()
+                
         except Exception as e:
             if debug:
                 print(f"    [DEBUG] Error parsing coverage XML: {e}")
@@ -927,6 +963,7 @@ module.exports = {
             failed = re.search(r"(\d+)\s+failed", output)
             
             measurement.tests_passing = int(passed.group(1)) if passed else 0
+            measurement.tests_failed = int(failed.group(1)) if failed else 0
             measurement.tests_compilable = measurement.test_files_created
             
             # Parse coverage from JSON summary
@@ -947,6 +984,11 @@ module.exports = {
                     
                     if debug:
                         print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+                
+                # Cleanup coverage directory
+                coverage_dir = test_dir / "coverage"
+                if coverage_dir.exists():
+                    shutil.rmtree(coverage_dir, ignore_errors=True)
             else:
                 # Try to parse from text output
                 # All files |   85.71 |      100 |     100 |   85.71
