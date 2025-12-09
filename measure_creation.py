@@ -121,15 +121,17 @@ class TestCreationMeasurer:
         if debug:
             print(f"    [DEBUG] Found {len(source_files)} source files")
         
-        # Create test output directory
+        # Create test output directory - clean it first to remove files from previous projects
         test_output_dir = self.work_dir / "generated_tests"
+        if test_output_dir.exists():
+            shutil.rmtree(test_output_dir)
         test_output_dir.mkdir(exist_ok=True)
         
         # Generate tests for each source file
         start_time = time.time()
         
         for source_file in source_files:
-            source_code = source_file.read_text(encoding='utf-8')
+            source_code = source_file.read_text(encoding='utf-8', errors='replace')
             module_name = source_file.stem  # e.g., "slugify" from "slugify.py"
             
             try:
@@ -171,7 +173,7 @@ class TestCreationMeasurer:
         
         # Check compilation and count tests
         for test_file in test_files:
-            content = test_file.read_text(encoding='utf-8')
+            content = test_file.read_text(encoding='utf-8', errors='replace')
             
             try:
                 tree = ast.parse(content)
@@ -233,7 +235,7 @@ class TestCreationMeasurer:
         
         # Fix imports in test files - replace "from src.X import" with "from X import"
         for test_file in test_dir.glob("test_*.py"):
-            test_content = test_file.read_text(encoding='utf-8')
+            test_content = test_file.read_text(encoding='utf-8', errors='replace')
             fixed_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
             if fixed_content != test_content:
                 test_file.write_text(fixed_content, encoding='utf-8')
@@ -262,7 +264,7 @@ class TestCreationMeasurer:
             
             # Show first few lines of test file to verify it has test functions
             if test_files:
-                content = test_files[0].read_text(encoding='utf-8')
+                content = test_files[0].read_text(encoding='utf-8', errors='replace')
                 lines = content.split('\n')[:30]
                 print(f"    [DEBUG] First 30 lines of {test_files[0].name}:")
                 for i, line in enumerate(lines):
@@ -361,7 +363,7 @@ class TestCreationMeasurer:
         total_patterns = 0
         
         for tf in test_files:
-            content = tf.read_text()
+            content = tf.read_text(encoding='utf-8', errors='replace')
             test_funcs = re.findall(r'def (test_\w+)\(', content)
             
             for func_name in test_funcs:
@@ -377,7 +379,7 @@ class TestCreationMeasurer:
         self,
         bot_name: str,
         project_path: str,
-        generate_tests: Callable[[str], str],
+        generate_tests: Callable[[str, str], str],
         project_name: str = "unnamed",
         debug: bool = False
     ) -> CreationMeasurement:
@@ -402,8 +404,10 @@ class TestCreationMeasurer:
         if debug:
             print(f"    [DEBUG] Found {len(source_files)} Java source files")
         
-        # Create test output directory
+        # Create test output directory - clean it first to remove files from previous projects
         test_output_dir = self.work_dir / "generated_tests"
+        if test_output_dir.exists():
+            shutil.rmtree(test_output_dir)
         test_output_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup Maven project structure
@@ -423,10 +427,12 @@ class TestCreationMeasurer:
         start_time = time.time()
         
         for source_file in source_files:
-            source_code = source_file.read_text(encoding='utf-8')
+            source_code = source_file.read_text(encoding='utf-8', errors='replace')
+            # Pass the class name (filename without extension) as module_name
+            module_name = source_file.stem  # e.g., "Slugify" from "Slugify.java"
             
             try:
-                generated_test = generate_tests(source_code)
+                generated_test = generate_tests(source_code, module_name)
                 
                 if generated_test:
                     # Extract code from markdown if present
@@ -442,6 +448,11 @@ class TestCreationMeasurer:
                 print(f"    Error generating test for {source_file.name}: {e}")
         
         measurement.generation_time_seconds = time.time() - start_time
+        
+        # Analyze generated tests
+        test_java = test_output_dir / "src" / "test" / "java"
+        if test_java.exists():
+            self._analyze_java_tests(measurement, test_java)
         
         # Run coverage measurement
         if measurement.test_files_created > 0:
@@ -639,27 +650,42 @@ class TestCreationMeasurer:
     def _parse_jacoco_csv(self, measurement: CreationMeasurement, csv_path: Path, debug: bool = False):
         """Parse JaCoCo CSV coverage report."""
         try:
-            coverage_data = csv_path.read_text(encoding='utf-8')
+            coverage_data = csv_path.read_text(encoding='utf-8', errors='replace')
             lines = coverage_data.strip().split('\n')
+            
+            if debug:
+                print(f"    [DEBUG] JaCoCo CSV has {len(lines)} lines")
+                if len(lines) > 0:
+                    print(f"    [DEBUG] Header: {lines[0]}")
+                if len(lines) > 1:
+                    print(f"    [DEBUG] First data row: {lines[1]}")
+            
             if len(lines) > 1:
                 total_covered = 0
                 total_missed = 0
                 for line in lines[1:]:  # Skip header
                     parts = line.split(',')
-                    if len(parts) >= 8:
+                    if debug:
+                        print(f"    [DEBUG] Row has {len(parts)} columns, class={parts[2] if len(parts) > 2 else 'N/A'}")
+                    if len(parts) >= 9:  # Need at least 9 columns (0-8)
                         try:
                             missed = int(parts[7])  # LINE_MISSED
                             covered = int(parts[8])  # LINE_COVERED
                             total_missed += missed
                             total_covered += covered
-                        except (ValueError, IndexError):
-                            pass
+                            if debug:
+                                print(f"    [DEBUG] Class {parts[2]}: missed={missed}, covered={covered}")
+                        except (ValueError, IndexError) as e:
+                            if debug:
+                                print(f"    [DEBUG] Parse error: {e}")
                 
                 total = total_covered + total_missed
                 if total > 0:
                     measurement.line_coverage = (total_covered / total) * 100
                     if debug:
-                        print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+                        print(f"    [DEBUG] Total coverage: {total_covered}/{total} = {measurement.line_coverage:.1f}%")
+                elif debug:
+                    print(f"    [DEBUG] No coverage data found (total=0)")
             
             # Cleanup coverage files
             csv_path.unlink()
@@ -714,7 +740,6 @@ class TestCreationMeasurer:
     def _analyze_java_tests(
         self,
         measurement: CreationMeasurement,
-        project_path: Path,
         test_dir: Path
     ):
         """Analyze generated Java tests."""
@@ -722,39 +747,17 @@ class TestCreationMeasurer:
         measurement.tests_generated = len(test_files)
         
         for test_file in test_files:
-            content = test_file.read_text()
-            measurement.test_loc += len(content.splitlines())
+            content = test_file.read_text(encoding='utf-8', errors='replace')
             
             # Check for basic syntax (simplified)
             if "class" in content and "@Test" in content:
                 measurement.tests_compilable += 1
-            
-            # Count assertions
-            assertion_patterns = [
-                r'assert\w+\(',
-                r'Assertions\.\w+\(',
-                r'assertThat\(',
-                r'verify\(',
-            ]
-            assertion_count = sum(len(re.findall(p, content)) for p in assertion_patterns)
-            measurement.total_assertions += assertion_count
-            if assertion_count > 0:
-                measurement.tests_with_assertions += 1
-            
-            # Count test methods
-            test_methods = len(re.findall(r'@Test\s+.*?void\s+\w+', content, re.DOTALL))
-            
-            # Quality indicators
-            if "@ParameterizedTest" in content:
-                measurement.has_edge_cases = True
-            if "assertThrows" in content or "expectedException" in content.lower():
-                measurement.has_error_handling_tests = True
     
     def measure_javascript(
         self,
         bot_name: str,
         project_path: str,
-        generate_tests: Callable[[str], str],
+        generate_tests: Callable[[str, str], str],
         project_name: str = "unnamed",
         debug: bool = False
     ) -> CreationMeasurement:
@@ -780,18 +783,22 @@ class TestCreationMeasurer:
         if debug:
             print(f"    [DEBUG] Found {len(source_files)} JavaScript source files")
         
-        # Create test output directory
+        # Create test output directory - clean it first to remove files from previous projects
         test_output_dir = self.work_dir / "generated_tests"
+        if test_output_dir.exists():
+            shutil.rmtree(test_output_dir)
         test_output_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate tests
         start_time = time.time()
         
         for source_file in source_files:
-            source_code = source_file.read_text(encoding='utf-8')
+            source_code = source_file.read_text(encoding='utf-8', errors='replace')
+            # Pass the filename (without extension) as module_name for correct imports
+            module_name = source_file.stem  # e.g., "camelCase" from "camelCase.js"
             
             try:
-                generated_test = generate_tests(source_code)
+                generated_test = generate_tests(source_code, module_name)
                 
                 if generated_test:
                     # Extract code from markdown if present
@@ -808,6 +815,9 @@ class TestCreationMeasurer:
         
         measurement.generation_time_seconds = time.time() - start_time
         
+        # Analyze generated tests
+        self._analyze_js_tests(measurement, test_output_dir)
+        
         # Run coverage measurement
         if measurement.test_files_created > 0:
             self._run_javascript_coverage(measurement, project_path, test_output_dir, debug)
@@ -816,7 +826,7 @@ class TestCreationMeasurer:
     
     def _fix_javascript_imports(self, test_file: Path, debug: bool = False):
         """Fix ES Module imports to CommonJS requires."""
-        content = test_file.read_text(encoding='utf-8')
+        content = test_file.read_text(encoding='utf-8', errors='replace')
         original = content
         
         # Remove ES Module imports that Jest doesn't support
@@ -854,6 +864,59 @@ class TestCreationMeasurer:
         
         test_file.write_text(content, encoding='utf-8')
     
+    def _convert_esm_to_commonjs(self, js_file: Path, debug: bool = False):
+        """Convert ES Module syntax to CommonJS in source files."""
+        content = js_file.read_text(encoding='utf-8', errors='replace')
+        original = content
+        
+        # Convert export default function/class/const
+        # export default function name() -> function name() ... module.exports = name;
+        # For simplicity, we'll convert to module.exports pattern
+        
+        # export default X -> module.exports = X
+        content = re.sub(
+            r'export\s+default\s+',
+            'module.exports = ',
+            content
+        )
+        
+        # export function name() -> function name() ... then add to exports
+        # First, find all exported function names
+        exported_functions = re.findall(r'export\s+function\s+(\w+)', content)
+        exported_consts = re.findall(r'export\s+(?:const|let|var)\s+(\w+)', content)
+        exported_classes = re.findall(r'export\s+class\s+(\w+)', content)
+        
+        # Remove 'export' keyword from declarations
+        content = re.sub(r'export\s+(function|class|const|let|var)\s+', r'\1 ', content)
+        
+        # Add module.exports at the end if there are named exports
+        all_exports = exported_functions + exported_consts + exported_classes
+        if all_exports:
+            exports_obj = ', '.join(all_exports)
+            # Check if module.exports already exists
+            if 'module.exports' not in content:
+                content = content.rstrip() + f'\n\nmodule.exports = {{ {exports_obj} }};\n'
+        
+        # Convert import statements to require
+        # import { x, y } from './module' -> const { x, y } = require('./module')
+        content = re.sub(
+            r"import\s*\{([^}]+)\}\s*from\s*['\"]([^'\"]+)['\"];?",
+            r"const {\1} = require('\2');",
+            content
+        )
+        
+        # import x from './module' -> const x = require('./module')
+        content = re.sub(
+            r"import\s+(\w+)\s+from\s*['\"]([^'\"]+)['\"];?",
+            r"const \1 = require('\2');",
+            content
+        )
+        
+        if content != original and debug:
+            print(f"    [DEBUG] Converted {js_file.name} from ESM to CommonJS")
+        
+        js_file.write_text(content, encoding='utf-8')
+    
     def _run_javascript_coverage(
         self,
         measurement: CreationMeasurement,
@@ -863,10 +926,18 @@ class TestCreationMeasurer:
     ):
         """Run JavaScript tests with Jest coverage."""
         
-        # Copy source files to test directory
+        # Copy source files to test directory and collect their names
+        source_file_names = []
         for src_file in project_path.glob("*.js"):
             if ".test." not in src_file.name and ".spec." not in src_file.name:
-                shutil.copy(src_file, test_dir / src_file.name)
+                dest_file = test_dir / src_file.name
+                shutil.copy(src_file, dest_file)
+                # Convert source file from ES Modules to CommonJS
+                self._convert_esm_to_commonjs(dest_file, debug)
+                source_file_names.append(src_file.name)
+        
+        if debug:
+            print(f"    [DEBUG] Source files for coverage: {source_file_names}")
         
         # Fix imports in test files (convert ES Modules to CommonJS)
         for test_file in test_dir.glob("*.test.js"):
@@ -895,17 +966,21 @@ class TestCreationMeasurer:
                 }
             }, indent=2))
         
-        # Create jest.config.js
+        # Build collectCoverageFrom array - only include actual source files
+        coverage_patterns = [f"./{name}" for name in source_file_names]
+        
+        # Create jest.config.js with explicit source file coverage
         jest_config = test_dir / "jest.config.js"
-        jest_config.write_text("""
-module.exports = {
+        jest_config.write_text(f"""
+module.exports = {{
     testEnvironment: 'node',
     collectCoverage: true,
+    collectCoverageFrom: {json.dumps(coverage_patterns)},
     coverageReporters: ['json-summary', 'text'],
     coverageDirectory: './coverage',
     testMatch: ['**/*.test.js', '**/*.spec.js'],
     moduleFileExtensions: ['js', 'json'],
-};
+}};
 """)
         
         # Determine correct command names for Windows vs Unix
@@ -1009,41 +1084,21 @@ module.exports = {
         measurement.tests_generated = len(test_files)
         
         for test_file in test_files:
-            content = test_file.read_text()
-            measurement.test_loc += len(content.splitlines())
-            
             # Check syntax with Node
             result = subprocess.run(
                 ["node", "--check", str(test_file)],
-                capture_output=True
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
             )
             if result.returncode == 0:
                 measurement.tests_compilable += 1
             else:
                 measurement.compilation_errors.append({
                     "file": test_file.name,
-                    "error": result.stderr.decode()
+                    "error": result.stderr or ""
                 })
-            
-            # Count assertions
-            assertion_patterns = [
-                r'expect\(',
-                r'\.toBe\(',
-                r'\.toEqual\(',
-                r'\.toThrow\(',
-                r'\.toHaveBeenCalled',
-                r'assert\.',
-            ]
-            assertion_count = sum(len(re.findall(p, content)) for p in assertion_patterns)
-            measurement.total_assertions += assertion_count
-            if assertion_count > 0:
-                measurement.tests_with_assertions += 1
-            
-            # Quality indicators
-            if "describe.each" in content or "it.each" in content:
-                measurement.has_edge_cases = True
-            if ".toThrow" in content or ".rejects" in content:
-                measurement.has_error_handling_tests = True
 
 
 def print_measurement_report(measurement: CreationMeasurement):

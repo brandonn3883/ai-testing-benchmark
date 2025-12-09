@@ -144,8 +144,8 @@ class ChatGPTBot(BotInterface):
         try:
             if self.debug:
                 print(f"\n[DEBUG ChatGPT] === REQUEST ===")
-                print(f"[DEBUG ChatGPT] System prompt:\n{system_prompt[:500]}...")
-                print(f"[DEBUG ChatGPT] User prompt:\n{user_prompt[:500]}...")
+                print(f"[DEBUG ChatGPT] System prompt:\n{system_prompt[:1000]}...")
+                print(f"[DEBUG ChatGPT] User prompt:\n{user_prompt[:1000]}...")
             
             response = self.client.responses.create(
                 model=self.model,

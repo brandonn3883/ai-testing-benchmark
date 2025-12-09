@@ -345,10 +345,12 @@ class TestMaintenanceMeasurer:
                 text=True,
                 timeout=30,
                 cwd=str(self.work_dir),
-                env=env
+                env=env,
+                encoding='utf-8',
+                errors='replace'
             )
             
-            output = result.stdout + result.stderr
+            output = (result.stdout or "") + (result.stderr or "")
             
             if result.returncode == 0 or "passed" in output.lower():
                 return True, "", ""
@@ -418,10 +420,12 @@ class TestMaintenanceMeasurer:
                 text=True,
                 timeout=120,
                 cwd=str(test_dir),
-                env=env
+                env=env,
+                encoding='utf-8',
+                errors='replace'
             )
             
-            output = result.stdout + result.stderr
+            output = (result.stdout or "") + (result.stderr or "")
             
             if debug:
                 print(f"    [DEBUG] pytest output for finding broken tests:\n{output[-800:]}")
@@ -672,9 +676,13 @@ class TestMaintenanceMeasurer:
                     
                     if debug:
                         print(f"    [DEBUG] Attempt {attempts}/{self.MAX_REPAIR_ATTEMPTS} to fix: {broken_test.test_name}")
+                        print(f"    [DEBUG] Current error type: {current_error_type}")
                     
                     try:
                         fixed_code = repair_function(current_code, current_error, current_error_type)
+                        
+                        if debug:
+                            print(f"    [DEBUG] Got fixed code: {len(fixed_code) if fixed_code else 0} chars")
                         
                         is_valid, new_error, new_error_type = self._validate_java_fix(
                             fixed_code, broken_test, test_dir, debug
@@ -696,7 +704,9 @@ class TestMaintenanceMeasurer:
                         else:
                             # This attempt failed
                             measurement.failed_attempts += 1
-                            current_code = fixed_code
+                            if debug:
+                                print(f"    [DEBUG] Fix attempt {attempts} failed: {new_error_type}")
+                            current_code = fixed_code if fixed_code else current_code
                             current_error = new_error
                             current_error_type = new_error_type
                             
@@ -704,9 +714,13 @@ class TestMaintenanceMeasurer:
                         measurement.failed_attempts += 1
                         if debug:
                             print(f"    [DEBUG] Repair error: {e}")
+                            import traceback
+                            traceback.print_exc()
                 
                 if not fixed:
                     measurement.failed_repairs += 1
+                    if debug:
+                        print(f"    [DEBUG] Failed to fix {broken_test.test_name} after {attempts} attempts")
         
         # Set errors_remain flag
         measurement.errors_remain = measurement.failed_repairs > 0
@@ -904,11 +918,13 @@ class TestMaintenanceMeasurer:
     ) -> tuple[bool, str, str]:
         """Validate Java fix by running tests with Maven and checking for errors (not failures)."""
         if not fixed_code or not fixed_code.strip():
+            if debug:
+                print(f"    [DEBUG] Empty fixed code returned")
             return False, "Empty code", "empty_error"
         
         # Write fixed code to the test file
         test_file = Path(broken_test.file_path)
-        original_code = test_file.read_text(encoding='utf-8')
+        original_code = test_file.read_text(encoding='utf-8', errors='replace')
         test_file.write_text(fixed_code, encoding='utf-8')
         
         import platform
@@ -929,8 +945,13 @@ class TestMaintenanceMeasurer:
             
             output = (result.stdout or "") + (result.stderr or "")
             
+            if debug:
+                print(f"    [DEBUG] Maven output (last 500 chars): {output[-500:]}")
+            
             # Check for compilation errors
             if "COMPILATION ERROR" in output:
+                if debug:
+                    print(f"    [DEBUG] Compilation error detected")
                 test_file.write_text(original_code, encoding='utf-8')
                 return False, output[-1000:], "compilation_error"
             
@@ -939,10 +960,15 @@ class TestMaintenanceMeasurer:
             errors_match = re.search(r"Errors:\s*(\d+)", output)
             num_errors = int(errors_match.group(1)) if errors_match else 0
             
+            if debug:
+                print(f"    [DEBUG] Errors found: {num_errors}")
+            
             if num_errors > 0:
                 # Still has errors - check if this specific test file is involved
                 test_name = broken_test.test_name.replace('.java', '')
                 if test_name in output:
+                    if debug:
+                        print(f"    [DEBUG] Errors still present in {test_name}")
                     test_file.write_text(original_code, encoding='utf-8')
                     return False, output[-1000:], "test_error"
                 # Errors exist but not in this file - consider it fixed
@@ -952,6 +978,8 @@ class TestMaintenanceMeasurer:
             return True, "", ""
             
         except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Validation exception: {e}")
             # Restore original code
             test_file.write_text(original_code, encoding='utf-8')
             return False, str(e), "compilation_error"
@@ -1048,31 +1076,85 @@ class TestMaintenanceMeasurer:
         return measurement
     
     def _find_javascript_errors(self, test_dir: Path, debug: bool = False) -> list[BrokenTest]:
-        """Find JavaScript syntax errors."""
+        """Find JavaScript syntax and runtime errors."""
         broken_tests = []
         
         test_files = list(test_dir.glob("*.test.js"))
         test_files.extend(test_dir.glob("*.spec.js"))
         
         for test_file in test_files:
-            result = subprocess.run(
-                ["node", "--check", str(test_file)],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                error_output = result.stderr
-                if debug:
-                    print(f"    [DEBUG] Syntax error in {test_file.name}: {error_output[:200]}")
+            try:
+                # First check syntax with node --check
+                result = subprocess.run(
+                    ["node", "--check", str(test_file)],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace'
+                )
                 
-                broken_tests.append(BrokenTest(
-                    file_path=str(test_file),
-                    test_name=test_file.name,
-                    code=test_file.read_text(encoding='utf-8'),
-                    error_type="syntax_error",
-                    error_message=error_output[:500]
-                ))
+                if result.returncode != 0:
+                    error_output = result.stderr or ""
+                    if debug:
+                        print(f"    [DEBUG] Syntax error in {test_file.name}: {error_output[:200]}")
+                    
+                    broken_tests.append(BrokenTest(
+                        file_path=str(test_file),
+                        test_name=test_file.name,
+                        code=test_file.read_text(encoding='utf-8', errors='replace'),
+                        error_type="syntax_error",
+                        error_message=error_output[:500]
+                    ))
+                    continue
+                
+                # Also try to run with Jest to catch runtime import errors
+                import platform
+                is_windows = platform.system() == "Windows"
+                npx_cmd = "npx.cmd" if is_windows else "npx"
+                
+                jest_result = subprocess.run(
+                    [npx_cmd, "jest", "--testPathPattern", test_file.name, "--no-coverage"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=60,
+                    shell=is_windows,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                
+                output = (jest_result.stdout or "") + (jest_result.stderr or "")
+                
+                # Check for runtime errors (not assertion failures)
+                # These include: SyntaxError, ReferenceError, TypeError during import
+                runtime_error_patterns = [
+                    r"SyntaxError:\s*Unexpected token",
+                    r"Cannot find module",
+                    r"ReferenceError:",
+                    r"TypeError:.*is not a function",
+                    r"Error \[ERR_REQUIRE_ESM\]",
+                ]
+                
+                for pattern in runtime_error_patterns:
+                    if re.search(pattern, output):
+                        if debug:
+                            print(f"    [DEBUG] Runtime error in {test_file.name}: {output[:300]}")
+                        
+                        broken_tests.append(BrokenTest(
+                            file_path=str(test_file),
+                            test_name=test_file.name,
+                            code=test_file.read_text(encoding='utf-8', errors='replace'),
+                            error_type="runtime_error",
+                            error_message=output[:500]
+                        ))
+                        break
+                        
+            except subprocess.TimeoutExpired:
+                if debug:
+                    print(f"    [DEBUG] Timeout checking {test_file.name}")
+            except Exception as e:
+                if debug:
+                    print(f"    [DEBUG] Error checking {test_file.name}: {e}")
         
         return broken_tests
     
@@ -1093,13 +1175,16 @@ class TestMaintenanceMeasurer:
         result = subprocess.run(
             ["node", "--check", str(temp_file)],
             capture_output=True,
-            text=True
+            text=True,
+            encoding='utf-8',
+            errors='replace'
         )
         
         if result.returncode == 0:
             return True, "", ""
         else:
-            return False, result.stderr[:500], "syntax_error"
+            error_msg = (result.stderr or "")[:500]
+            return False, error_msg, "syntax_error"
 
 
 if __name__ == "__main__":

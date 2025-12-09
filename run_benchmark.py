@@ -516,11 +516,11 @@ def discover_projects(language: str, base_dir: Path = None) -> list[Path]:
 
 def main():
     parser = argparse.ArgumentParser(description="AI Testing Bot Benchmark")
-    parser.add_argument("--bot", type=str, choices=["chatgpt", "claude", "gemini"],
-                        help="Bot to benchmark")
-    parser.add_argument("--all", action="store_true", help="Benchmark all available bots")
+    parser.add_argument("--bot", type=str, choices=["chatgpt", "claude", "gemini", "all"],
+                        help="Bot to benchmark (or 'all' to run all bots)")
     parser.add_argument("--language", type=str, required=True,
-                        choices=["python", "java", "javascript"], help="Programming language")
+                        choices=["python", "java", "javascript", "all"], 
+                        help="Programming language (or 'all' to run all languages)")
     parser.add_argument("--project", type=str, default=None,
                         help="Path to source code (if not specified, runs all projects in ./<language>/ folder)")
     parser.add_argument("--output", type=str, default="./benchmark_results", help="Output directory")
@@ -529,26 +529,23 @@ def main():
     
     args = parser.parse_args()
     
+    # Handle --bot all - set a flag for running all bots
+    run_all_bots = False
+    if args.bot and args.bot.lower() == "all":
+        run_all_bots = True
+        args.bot = None
+    
     if args.debug:
-        print(f"[DEBUG] Args: bot={args.bot}, all={args.all}, language={args.language}, project={args.project}")
+        print(f"[DEBUG] Args: bot={args.bot}, run_all_bots={run_all_bots}, language={args.language}, project={args.project}")
     
-    if not args.bot and not args.all:
-        parser.error("Specify --bot or --all")
+    if not args.bot and not run_all_bots:
+        parser.error("Specify --bot <bot_name> or --bot all")
     
-    # Discover projects if not specified
-    if args.project:
-        project_paths = [Path(args.project)]
-        if not project_paths[0].exists():
-            parser.error(f"Project path does not exist: {args.project}")
+    # Determine which languages to run
+    if args.language.lower() == "all":
+        languages = ["python", "java", "javascript"]
     else:
-        project_paths = discover_projects(args.language)
-        if not project_paths:
-            parser.error(f"No projects found in ./{args.language}/ directory. "
-                        f"Create projects as ./{args.language}/<project_name>/src/ or use --project flag.")
-        print(f"\nDiscovered {len(project_paths)} project(s):")
-        for p in project_paths:
-            print(f"  - {p}")
-        print()
+        languages = [args.language]
     
     # Create runner
     try:
@@ -560,42 +557,64 @@ def main():
             traceback.print_exc()
         return
     
-    # Run benchmarks for each project
-    for project_path in project_paths:
-        if args.debug:
-            print(f"\n[DEBUG] Processing project: {project_path}")
-            print(f"[DEBUG] Files in project:")
-            for f in project_path.iterdir():
-                print(f"[DEBUG]   {f.name}")
+    # Run benchmarks for each language
+    for language in languages:
+        print(f"\n{'#'*60}")
+        print(f"# LANGUAGE: {language.upper()}")
+        print(f"{'#'*60}")
         
-        if args.all:
-            try:
-                runner.run_all_bots(
-                    project_path=str(project_path),
-                    language=args.language,
-                    verbose=not args.quiet,
-                    debug=args.debug
-                )
-            except Exception as e:
-                print(f"Error running all bots on {project_path}: {e}")
-                if args.debug:
-                    import traceback
-                    traceback.print_exc()
+        # Discover projects for this language
+        if args.project:
+            project_paths = [Path(args.project)]
+            if not project_paths[0].exists():
+                print(f"Project path does not exist: {args.project}")
+                continue
         else:
-            try:
-                bot = create_bot(args.bot, debug=args.debug)
-                runner.run_benchmark(
-                    bot=bot,
-                    project_path=str(project_path),
-                    language=args.language,
-                    verbose=not args.quiet,
-                    debug=args.debug
-                )
-            except Exception as e:
-                print(f"Error running {args.bot} on {project_path}: {e}")
-                if args.debug:
-                    import traceback
-                    traceback.print_exc()
+            project_paths = discover_projects(language)
+            if not project_paths:
+                print(f"No projects found in ./{language}/ directory. Skipping.")
+                continue
+            print(f"\nDiscovered {len(project_paths)} project(s):")
+            for p in project_paths:
+                print(f"  - {p}")
+            print()
+        
+        # Run benchmarks for each project
+        for project_path in project_paths:
+            if args.debug:
+                print(f"\n[DEBUG] Processing project: {project_path}")
+                print(f"[DEBUG] Files in project:")
+                for f in project_path.iterdir():
+                    print(f"[DEBUG]   {f.name}")
+            
+            if run_all_bots:
+                try:
+                    runner.run_all_bots(
+                        project_path=str(project_path),
+                        language=language,
+                        verbose=not args.quiet,
+                        debug=args.debug
+                    )
+                except Exception as e:
+                    print(f"Error running all bots on {project_path}: {e}")
+                    if args.debug:
+                        import traceback
+                        traceback.print_exc()
+            else:
+                try:
+                    bot = create_bot(args.bot, debug=args.debug)
+                    runner.run_benchmark(
+                        bot=bot,
+                        project_path=str(project_path),
+                        language=language,
+                        verbose=not args.quiet,
+                        debug=args.debug
+                    )
+                except Exception as e:
+                    print(f"Error running {args.bot} on {project_path}: {e}")
+                    if args.debug:
+                        import traceback
+                        traceback.print_exc()
     
     # Save CSV results
     if args.debug:

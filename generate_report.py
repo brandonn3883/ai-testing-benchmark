@@ -50,7 +50,7 @@ class CSVReportGenerator:
                 "bot_name", "language", "project", "timestamp",
                 "test_coverage_pct", "tests_failed",
                 "mutation_score_pct", "mutants_killed", "mutants_survived", 
-                "errors_fixed_pct", "errors_remain"
+                "errors_fixed_pct", "failed_repairs", "errors_remain"
             ])
             
             # Data rows
@@ -71,16 +71,18 @@ class CSVReportGenerator:
                 if r["maintenance"]:
                     fixed_pct = r["maintenance"].get_fix_percentage()
                     fixed_pct_str = "N/A" if fixed_pct is None else str(round(fixed_pct, 2))
+                    failed_repairs = r["maintenance"].failed_repairs
                     errors_remain = r["maintenance"].errors_remain
                 else:
                     fixed_pct_str = "N/A"
+                    failed_repairs = 0
                     errors_remain = False
                 
                 writer.writerow([
                     r["bot_name"], r["language"], r["project_name"], r["timestamp"],
                     round(coverage, 2), tests_failed,
                     round(mutation_score, 2), killed, survived, 
-                    fixed_pct_str, errors_remain
+                    fixed_pct_str, failed_repairs, errors_remain
                 ])
         
         return str(filepath)
@@ -183,34 +185,6 @@ class CSVReportGenerator:
             "execution": self.generate_execution_csv(),
             "maintenance": self.generate_maintenance_csv()
         }
-    
-    def print_summary(self):
-        """Print summary to console."""
-        print("\n" + "=" * 60)
-        print("BENCHMARK RESULTS")
-        print("=" * 60)
-        
-        for r in self.results:
-            coverage = r["creation"].line_coverage if r["creation"] else 0
-            
-            if r["execution"]:
-                mutation_score = r["execution"].mutation_score
-                survived = r["execution"].mutants_survived
-            else:
-                mutation_score = 0
-                survived = 0
-            
-            if r["maintenance"]:
-                fixed_display = r["maintenance"].get_fix_percentage_display()
-            else:
-                fixed_display = "N/A"
-            
-            print(f"\n{r['bot_name']} ({r['language']}):")
-            print(f"  Test Coverage:      {coverage:.1f}%")
-            print(f"  Mutation Score:     {mutation_score:.1f}%")
-            print(f"  Surviving Mutants:  {survived} (false negatives)")
-            print(f"  Errors Fixed:       {fixed_display}")
-
 
 if __name__ == "__main__":
     print("CSV Report Generator")

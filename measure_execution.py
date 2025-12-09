@@ -207,7 +207,7 @@ class TestExecutionMeasurer:
             if mutants_tested >= max_mutants:
                 break
                 
-            original_code = source_file.read_text(encoding='utf-8')
+            original_code = source_file.read_text(encoding='utf-8', errors='replace')
             
             # Generate mutants for this file
             mutants = self._generate_mutants(original_code, max_mutants - mutants_tested)
@@ -300,7 +300,7 @@ class TestExecutionMeasurer:
         
         # Copy test files and fix imports
         for test_file in test_path.glob("test_*.py"):
-            test_content = test_file.read_text(encoding='utf-8')
+            test_content = test_file.read_text(encoding='utf-8', errors='replace')
             # Fix imports - replace "from src.X import" with "from X import"
             # This handles cases like "from src.slugify import ..." -> "from slugify import ..."
             test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
@@ -357,7 +357,7 @@ class TestExecutionMeasurer:
         
         # Fix imports in test files - replace "from src.X import" with "from X import"
         for test_file in test_path.glob("test_*.py"):
-            test_content = test_file.read_text(encoding='utf-8')
+            test_content = test_file.read_text(encoding='utf-8', errors='replace')
             fixed_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
             if fixed_content != test_content:
                 test_file.write_text(fixed_content, encoding='utf-8')
@@ -501,7 +501,7 @@ class TestExecutionMeasurer:
     
     def _ensure_pitest_plugin(self, pom_file: Path, debug: bool = False):
         """Add PITest plugin to pom.xml if not already present."""
-        content = pom_file.read_text(encoding='utf-8')
+        content = pom_file.read_text(encoding='utf-8', errors='replace')
         
         if 'pitest-maven' in content:
             if debug:
@@ -628,7 +628,7 @@ class TestExecutionMeasurer:
         results = {"total": 0, "killed": 0, "survived": 0}
         
         try:
-            content = csv_file.read_text(encoding='utf-8')
+            content = csv_file.read_text(encoding='utf-8', errors='replace')
             lines = content.strip().split('\n')
             
             for line in lines[1:]:  # Skip header
@@ -758,13 +758,32 @@ class TestExecutionMeasurer:
         if debug:
             print("    [DEBUG] Starting JavaScript mutation testing...")
         
+        # Only mutate source files that exist in the original project_path
+        # This prevents mutating leftover files from previous runs
+        original_source_files = [f.name for f in project_path.glob("*.js") 
+                                 if ".test." not in f.name and ".spec." not in f.name]
+        
         source_files = [f for f in test_path.glob("*.js") 
                        if ".test." not in f.name and ".spec." not in f.name 
-                       and "jest.config" not in f.name]
+                       and "jest.config" not in f.name
+                       and f.name in original_source_files]  # Only files from current project
+        
+        if debug:
+            print(f"    [DEBUG] Found {len(source_files)} source file(s) for mutation")
+            for sf in source_files:
+                print(f"    [DEBUG]   - {sf.name}")
+        
+        if not source_files:
+            if debug:
+                print("    [DEBUG] No source files found for mutation testing")
+            return measurement
         
         mutation_results = self._run_manual_js_mutation_testing(
             source_files, test_path, max_mutants, debug
         )
+        
+        if debug:
+            print(f"    [DEBUG] Mutation results: {mutation_results}")
         
         measurement.total_mutants = mutation_results["total"]
         measurement.mutants_killed = mutation_results["killed"]
@@ -834,7 +853,7 @@ class TestExecutionMeasurer:
         npx_cmd = "npx.cmd" if is_windows else "npx"
         
         for source_file in source_files:
-            code = source_file.read_text(encoding='utf-8')
+            code = source_file.read_text(encoding='utf-8', errors='replace')
             mutants = self._generate_javascript_mutants(code, max_mutants - results["total"])
             
             for mutant_code, desc, line_num in mutants:
