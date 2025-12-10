@@ -72,7 +72,7 @@ OUTPUT FORMAT:
         if language == "python" and module_name:
             import_instruction = f"\nIMPORTANT: Import the functions to test using: from {module_name} import *\n"
         elif language == "java" and module_name:
-            import_instruction = f"\nIMPORTANT: Do not include a package declaration and do not use mockito or import any other libraries other than those from the source code and JUnit\n"
+            import_instruction = f"\nIMPORTANT: Do NOT include a package declaration and do not use mockito or import any other libraries other than those from the source code and JUnit\n"
         elif language == "javascript":
             if module_name:
                 import_instruction = f"""
@@ -154,6 +154,7 @@ OUTPUT FORMAT:
 - Return ONLY the corrected test code
 - Do NOT include any explanations or markdown formatting
 - Do NOT wrap the code in code blocks
+- Do NOT use a package declaration
 - The output should be directly executable"""
 
     @staticmethod

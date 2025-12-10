@@ -580,17 +580,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             print(f"        [DEBUG] Generated {len(mutants)} mutants")
         
         # Test each mutant (limit to 20)
-        for mutant_code in mutants[:20]:
+        mutants_to_test = mutants[:20]
+        for i, mutant_code in enumerate(mutants_to_test):
+            if debug:
+                print(f"        [DEBUG] Testing mutant {i+1}/{len(mutants_to_test)}...", end=" ", flush=True)
+            
             killed = self._test_python_mutant(
                 source_in_test_dir, mutant_code, original_code,
                 test_path, test_dir
             )
             if killed:
                 results["killed"] += 1
+                if debug:
+                    print("killed")
             else:
                 results["survived"] += 1
+                if debug:
+                    print("survived")
         
-        results["total"] = min(len(mutants), 20)
+        results["total"] = len(mutants_to_test)
         
         return results
     
@@ -634,23 +642,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         env = os.environ.copy()
         env["PYTHONPATH"] = str(test_dir)
         
+        killed = True  # Default to killed (safer assumption on timeout/error)
+        
         try:
             result = subprocess.run(
-                ["python", "-m", "pytest", test_path.name, "-x", "--tb=no", "-q"],
+                ["python", "-m", "pytest", test_path.name, "-x", "--tb=no", "-q", "--timeout=10"],
                 capture_output=True,
                 text=True,
                 cwd=str(test_dir),
                 env=env,
-                timeout=30,
+                timeout=15,  # Shorter timeout
                 encoding='utf-8',
                 errors='replace'
             )
             killed = result.returncode != 0
-        except:
+        except subprocess.TimeoutExpired:
+            # Timeout means mutant likely caused infinite loop - count as killed
+            killed = True
+        except Exception:
+            # Any other error - count as killed
             killed = True
         finally:
-            # Restore original
-            source_path.write_text(original_code, encoding='utf-8')
+            # Always restore original
+            try:
+                source_path.write_text(original_code, encoding='utf-8')
+            except:
+                pass
         
         return killed
     
@@ -662,10 +679,874 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         verbose: bool,
         debug: bool
     ) -> List[FileResult]:
-        """Run per-file benchmark for Java (placeholder)."""
+        """Run per-file benchmark for Java."""
+        
+        # Check if Java/javac is available
+        javac_cmd = "javac"
+        java_cmd = "java"
+        
+        try:
+            subprocess.run([javac_cmd, "-version"], capture_output=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            if verbose:
+                print("    ✗ Java compiler (javac) not found. Please install JDK.")
+                print("    Skipping Java benchmark.")
+            return []
+        
+        # Find all source files
+        all_source_files = list(project_path.rglob("*.java"))
+        # Exclude test files
+        all_source_files = [f for f in all_source_files 
+                           if not f.name.endswith('Test.java') 
+                           and not f.name.endswith('Tests.java')
+                           and not f.name.startswith('Test')
+                           and 'test' not in str(f).lower().split(os.sep)]
+        
+        # Files to test
+        testable_files = [f for f in all_source_files 
+                         if not f.name.startswith('.')]
+        
         if verbose:
-            print("    Java per-file benchmark not yet implemented")
-        return []
+            print(f"\n    Found {len(testable_files)} testable file(s)")
+        
+        if not testable_files:
+            if verbose:
+                print("    No Java files found to test")
+            return []
+        
+        # Create work directory
+        test_dir = self.work_dir / "generated_tests"
+        if test_dir.exists():
+            shutil.rmtree(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy ALL source files
+        if debug:
+            print(f"    [DEBUG] Copying source files to {test_dir}")
+        
+        # Extract package info and copy files
+        package_info = {}  # filename -> package name
+        for src_file in all_source_files:
+            content = src_file.read_text(encoding='utf-8', errors='replace')
+            # Extract package declaration
+            package_match = re.search(r'package\s+([\w.]+)\s*;', content)
+            package_name = package_match.group(1) if package_match else ""
+            package_info[src_file.name] = package_name
+            
+            # Copy file (remove package declaration for flat structure)
+            content_no_package = re.sub(r'package\s+[\w.]+\s*;', '', content)
+            dest_file = test_dir / src_file.name
+            dest_file.write_text(content_no_package, encoding='utf-8')
+            if debug:
+                print(f"    [DEBUG]   Copied: {src_file.name} (package: {package_name})")
+        
+        if debug:
+            print(f"    [DEBUG] Files in test_dir: {[f.name for f in test_dir.glob('*.java')]}")
+        
+        # Download JUnit if not present
+        junit_jar = test_dir / "junit-platform-console-standalone.jar"
+        jacoco_agent = test_dir / "jacocoagent.jar"
+        jacoco_cli = test_dir / "jacococli.jar"
+        
+        if not junit_jar.exists():
+            if verbose:
+                print("    Downloading JUnit...")
+            try:
+                # Download JUnit standalone
+                junit_url = "https://repo1.maven.org/maven2/org/junit/platform/junit-platform-console-standalone/1.10.0/junit-platform-console-standalone-1.10.0.jar"
+                self._download_file(junit_url, junit_jar)
+                if verbose:
+                    print("    JUnit downloaded successfully")
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Could not download JUnit: {e}")
+                    print("    Skipping Java benchmark.")
+                return []
+        
+        if not jacoco_agent.exists():
+            if verbose:
+                print("    Downloading JaCoCo...")
+            try:
+                # Download JaCoCo agent
+                jacoco_agent_url = "https://repo1.maven.org/maven2/org/jacoco/org.jacoco.agent/0.8.11/org.jacoco.agent-0.8.11-runtime.jar"
+                self._download_file(jacoco_agent_url, jacoco_agent)
+                # Download JaCoCo CLI
+                jacoco_cli_url = "https://repo1.maven.org/maven2/org/jacoco/org.jacoco.cli/0.8.11/org.jacoco.cli-0.8.11-nodeps.jar"
+                self._download_file(jacoco_cli_url, jacoco_cli)
+                if verbose:
+                    print("    JaCoCo downloaded successfully")
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Could not download JaCoCo: {e}")
+        
+        # Scan source files for external dependencies and download them
+        external_jars = self._download_java_dependencies(test_dir, all_source_files, verbose, debug)
+        
+        # Build class contents map for context
+        class_contents = {}
+        for sf in all_source_files:
+            class_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
+        # Process each file
+        results = []
+        for idx, source_file in enumerate(testable_files):
+            if verbose:
+                print(f"\n    [{idx + 1}/{len(testable_files)}] {source_file.name}")
+            
+            result = self._process_java_file(
+                bot=bot,
+                source_file=source_file,
+                test_dir=test_dir,
+                project_name=project_name,
+                class_contents=class_contents,
+                all_source_files=all_source_files,
+                junit_jar=junit_jar,
+                jacoco_agent=jacoco_agent,
+                jacoco_cli=jacoco_cli,
+                external_jars=external_jars,
+                verbose=verbose,
+                debug=debug
+            )
+            results.append(result)
+            self.results.append(result)
+        
+        # Print summary
+        if verbose:
+            self._print_project_summary(results)
+        
+        return results
+    
+    def _download_file(self, url: str, dest: Path):
+        """Download a file from URL."""
+        import urllib.request
+        urllib.request.urlretrieve(url, str(dest))
+    
+    def _download_java_dependencies(
+        self, 
+        test_dir: Path, 
+        source_files: list, 
+        verbose: bool, 
+        debug: bool
+    ) -> List[Path]:
+        """Scan source files for external imports and download required JARs."""
+        
+        # Map of known imports to Maven coordinates
+        dependency_map = {
+            'com.ibm.icu': {
+                'name': 'ICU4J',
+                'jar': 'icu4j.jar',
+                'url': 'https://repo1.maven.org/maven2/com/ibm/icu/icu4j/74.2/icu4j-74.2.jar'
+            },
+            'lombok': {
+                'name': 'Lombok',
+                'jar': 'lombok.jar',
+                'url': 'https://repo1.maven.org/maven2/org/projectlombok/lombok/1.18.30/lombok-1.18.30.jar'
+            },
+            'org.apache.commons.lang3': {
+                'name': 'Apache Commons Lang',
+                'jar': 'commons-lang3.jar',
+                'url': 'https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar'
+            },
+            'org.apache.commons.io': {
+                'name': 'Apache Commons IO',
+                'jar': 'commons-io.jar',
+                'url': 'https://repo1.maven.org/maven2/commons-io/commons-io/2.15.1/commons-io-2.15.1.jar'
+            },
+            'com.google.gson': {
+                'name': 'Gson',
+                'jar': 'gson.jar',
+                'url': 'https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar'
+            },
+            'com.fasterxml.jackson': {
+                'name': 'Jackson',
+                'jar': 'jackson-databind.jar',
+                'url': 'https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.16.1/jackson-databind-2.16.1.jar'
+            },
+            'org.slf4j': {
+                'name': 'SLF4J',
+                'jar': 'slf4j-api.jar',
+                'url': 'https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.11/slf4j-api-2.0.11.jar'
+            },
+            'com.google.guava': {
+                'name': 'Guava',
+                'jar': 'guava.jar',
+                'url': 'https://repo1.maven.org/maven2/com/google/guava/guava/33.0.0-jre/guava-33.0.0-jre.jar'
+            },
+        }
+        
+        # Scan all source files for imports
+        needed_deps = set()
+        for src_file in source_files:
+            try:
+                content = src_file.read_text(encoding='utf-8', errors='replace')
+                for import_match in re.finditer(r'import\s+([\w.]+)', content):
+                    import_path = import_match.group(1)
+                    # Check if this import matches any known dependency
+                    for dep_prefix, dep_info in dependency_map.items():
+                        if import_path.startswith(dep_prefix):
+                            needed_deps.add(dep_prefix)
+                            break
+            except:
+                pass
+        
+        # Download needed dependencies
+        downloaded_jars = []
+        for dep_prefix in needed_deps:
+            dep_info = dependency_map[dep_prefix]
+            jar_path = test_dir / dep_info['jar']
+            
+            if not jar_path.exists():
+                if verbose:
+                    print(f"    Downloading {dep_info['name']}...")
+                try:
+                    self._download_file(dep_info['url'], jar_path)
+                    # Verify download succeeded
+                    if jar_path.exists() and jar_path.stat().st_size > 0:
+                        downloaded_jars.append(jar_path)
+                        if verbose:
+                            print(f"    {dep_info['name']} downloaded successfully ({jar_path.stat().st_size} bytes)")
+                    else:
+                        if verbose:
+                            print(f"    Warning: {dep_info['name']} download failed - file empty or missing")
+                except Exception as e:
+                    if verbose:
+                        print(f"    Warning: Could not download {dep_info['name']}: {e}")
+            else:
+                downloaded_jars.append(jar_path)
+                if debug:
+                    print(f"    [DEBUG] {dep_info['name']} already exists ({jar_path.stat().st_size} bytes)")
+        
+        if debug and downloaded_jars:
+            print(f"    [DEBUG] External JARs to use: {[str(j.absolute()) for j in downloaded_jars]}")
+        
+        return downloaded_jars
+    
+    def _process_java_file(
+        self,
+        bot: BotInterface,
+        source_file: Path,
+        test_dir: Path,
+        project_name: str,
+        class_contents: dict,
+        all_source_files: list,
+        junit_jar: Path,
+        jacoco_agent: Path,
+        jacoco_cli: Path,
+        external_jars: List[Path],
+        verbose: bool,
+        debug: bool
+    ) -> FileResult:
+        """Process a single Java file through the complete pipeline."""
+        
+        result = FileResult(
+            bot_name=bot.name,
+            language="java",
+            project_name=project_name,
+            file_name=source_file.name
+        )
+        
+        source_code = source_file.read_text(encoding='utf-8', errors='replace')
+        class_name = source_file.stem
+        test_filename = f"{class_name}Test.java"
+        test_path = test_dir / test_filename
+        
+        # ========== STEP 1: Generate Test ==========
+        if verbose:
+            print(f"        [1/3] Test Creation...")
+        start_time = time.time()
+        
+        # Build context with dependencies
+        code_with_context = self._build_java_context(
+            source_code, class_name, class_contents, all_source_files, source_file
+        )
+        
+        try:
+            generated_test = bot.generate_tests(
+                code_with_context, 
+                module_name=class_name, 
+                language="java"
+            )
+            if generated_test:
+                # Remove package declaration if present
+                generated_test = re.sub(r'package\s+[\w.]+\s*;', '', generated_test)
+                # Ensure JUnit imports
+                if 'import org.junit' not in generated_test and 'import static org.junit' not in generated_test:
+                    imports = "import org.junit.jupiter.api.*;\nimport static org.junit.jupiter.api.Assertions.*;\n\n"
+                    generated_test = imports + generated_test
+                
+                test_path.write_text(generated_test, encoding='utf-8')
+                result.test_generated = True
+                if verbose:
+                    print(f"              ✓ Test generated")
+            else:
+                if verbose:
+                    print(f"              ✗ No test generated")
+                return result
+        except Exception as e:
+            if verbose:
+                print(f"              ✗ Generation error: {e}")
+            return result
+        
+        result.generation_time_seconds = time.time() - start_time
+        
+        # ========== STEP 2: Compile and Run Tests ==========
+        coverage, passed, failed, error_msg = self._run_java_coverage(
+            test_path, class_name, test_dir, junit_jar, jacoco_agent, jacoco_cli, external_jars, debug
+        )
+        
+        result.tests_passed = passed
+        result.tests_failed = failed
+        
+        # ========== STEP 3: If Error, Fix (Maintenance) ==========
+        if error_msg:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+            result.had_errors = True
+            result.errors_remain = True
+            if verbose:
+                print(f"              ✗ Tests have errors, attempting fix...")
+            
+            for attempt in range(3):
+                result.fix_attempts += 1
+                try:
+                    current_test = test_path.read_text(encoding='utf-8', errors='replace')
+                    fixed_test = bot.repair_test(
+                        current_test, error_msg, "test_error"
+                    )
+                    
+                    if fixed_test:
+                        # Remove package declaration if present
+                        fixed_test = re.sub(r'package\s+[\w.]+\s*;', '', fixed_test)
+                        test_path.write_text(fixed_test, encoding='utf-8')
+                        
+                        # Re-run tests
+                        coverage, passed, failed, error_msg = self._run_java_coverage(
+                            test_path, class_name, test_dir, junit_jar, jacoco_agent, jacoco_cli, external_jars, debug
+                        )
+                        
+                        result.tests_passed = passed
+                        result.tests_failed = failed
+                        
+                        if not error_msg:
+                            result.errors_fixed = True
+                            result.errors_remain = False
+                            if attempt == 0:
+                                result.first_attempt_fix = True
+                            if verbose:
+                                print(f"              ✓ Fixed on attempt {attempt + 1}")
+                            break
+                except Exception as e:
+                    if debug:
+                        print(f"              [DEBUG] Fix attempt {attempt + 1} failed: {e}")
+            
+            if result.errors_remain and verbose:
+                print(f"              ✗ Could not fix after {result.fix_attempts} attempts")
+        else:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+                print(f"              No errors to fix")
+        
+        # Record coverage
+        if coverage is not None:
+            result.line_coverage_pct = coverage
+            if verbose:
+                print(f"              Coverage: {coverage:.1f}%")
+        
+        # ========== STEP 4: If No Error, Run Mutation Testing (Execution) ==========
+        if verbose:
+            print(f"        [3/3] Test Execution (Mutation Testing)...")
+        
+        if debug:
+            print(f"              [DEBUG] Java mutation check: errors_remain={result.errors_remain}, tests_passed={result.tests_passed}")
+        
+        if not result.errors_remain and result.tests_passed > 0:
+            mutation_results = self._run_java_mutation(
+                source_file, test_path, test_dir, class_name, junit_jar, external_jars, debug
+            )
+            
+            result.mutants_total = mutation_results.get("total", 0)
+            result.mutants_killed = mutation_results.get("killed", 0)
+            result.mutants_survived = mutation_results.get("survived", 0)
+            
+            if result.mutants_total > 0:
+                result.mutation_score_pct = (result.mutants_killed / result.mutants_total) * 100
+                if verbose:
+                    print(f"              Mutants: {result.mutants_killed}/{result.mutants_total} killed ({result.mutation_score_pct:.1f}%)")
+            else:
+                if verbose:
+                    print(f"              No mutants generated")
+        else:
+            if verbose:
+                if result.errors_remain:
+                    print(f"              Skipped (errors remain)")
+                else:
+                    print(f"              Skipped (no passing tests: {result.tests_passed})")
+        
+        return result
+    
+    def _build_java_context(
+        self, 
+        source_code: str, 
+        class_name: str, 
+        class_contents: dict, 
+        all_source_files: list,
+        source_file: Path
+    ) -> str:
+        """Build source code with dependency context for Java."""
+        # Find import statements for local classes
+        imports = []
+        for match in re.finditer(r'import\s+([\w.]+)\s*;', source_code):
+            import_path = match.group(1)
+            # Get the class name (last part)
+            imported_class = import_path.split('.')[-1]
+            if imported_class != '*':
+                imports.append(imported_class)
+        
+        # Also look for class references in code
+        for other_class in class_contents.keys():
+            if other_class != class_name and other_class in source_code:
+                if other_class not in imports:
+                    imports.append(other_class)
+        
+        dependency_code = ""
+        for imp in imports:
+            if imp in class_contents and imp != class_name:
+                dep_content = class_contents[imp]
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n// ... (truncated)"
+                dependency_code += f"\n\n// === DEPENDENCY: {imp}.java ===\n{dep_content}"
+        
+        if dependency_code:
+            return source_code + "\n\n// === PROJECT DEPENDENCIES ===" + dependency_code
+        elif len(all_source_files) > 1:
+            other_files = [sf.name for sf in all_source_files if sf != source_file]
+            if other_files:
+                return source_code + f"\n\n// NOTE: Project also contains: {', '.join(other_files)}"
+        
+        return source_code
+    
+    def _run_java_coverage(
+        self, 
+        test_path: Path, 
+        class_name: str, 
+        test_dir: Path,
+        junit_jar: Path,
+        jacoco_agent: Path,
+        jacoco_cli: Path,
+        external_jars: List[Path],
+        debug: bool
+    ) -> tuple:
+        """
+        Compile and run Java tests with coverage.
+        Returns: (coverage_pct, tests_passed, tests_failed, error_message)
+        """
+        # Classpath separator
+        cp_sep = ";" if os.name == 'nt' else ":"
+        
+        # Build classpath with external JARs (use absolute paths)
+        jar_paths = [str(test_dir.absolute())]
+        for j in external_jars:
+            jar_paths.append(str(j.absolute()))
+        base_classpath = cp_sep.join(jar_paths)
+        
+        if debug:
+            print(f"              [DEBUG] Classpath: {base_classpath[:200]}...")
+            print(f"              [DEBUG] External JARs: {[j.name for j in external_jars]}")
+            for j in external_jars:
+                print(f"              [DEBUG]   {j.name} exists: {j.exists()}")
+        
+        # Step 1: Compile source files
+        source_files = list(test_dir.glob("*.java"))
+        source_files = [f for f in source_files if not f.name.endswith("Test.java")]
+        
+        if source_files:
+            # Use just filenames since we're running from test_dir
+            source_filenames = [f.name for f in source_files]
+            # Add -encoding UTF-8 to handle unicode characters
+            compile_cmd = ["javac", "-encoding", "UTF-8", "-cp", base_classpath] + source_filenames
+            
+            if debug:
+                print(f"              [DEBUG] Compile command: javac -encoding UTF-8 -cp <classpath> {' '.join(source_filenames)}")
+            
+            try:
+                result = subprocess.run(
+                    compile_cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=60,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                if result.returncode != 0:
+                    if debug:
+                        print(f"              [DEBUG] Source compilation failed: {result.stderr[:300]}")
+                    return None, 0, 0, f"Compilation error: {result.stderr[:200]}"
+            except Exception as e:
+                return None, 0, 0, f"Compilation error: {e}"
+        
+        # Step 2: Compile test file
+        classpath = f"{base_classpath}{cp_sep}{str(junit_jar.absolute())}"
+        # Use just filename since we're running from test_dir
+        # Add -encoding UTF-8 to handle unicode characters in test file
+        compile_test_cmd = ["javac", "-encoding", "UTF-8", "-cp", classpath, test_path.name]
+        
+        if debug:
+            print(f"              [DEBUG] Test compile classpath includes JUnit: {junit_jar.absolute()}")
+            print(f"              [DEBUG] JUnit JAR exists: {junit_jar.exists()}")
+        
+        try:
+            result = subprocess.run(
+                compile_test_cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=60,
+                encoding='utf-8',
+                errors='replace'
+            )
+            if result.returncode != 0:
+                error_msg = result.stderr[:300] if result.stderr else "Unknown compilation error"
+                if debug:
+                    print(f"              [DEBUG] Test compilation failed: {error_msg}")
+                return None, 0, 0, error_msg
+        except Exception as e:
+            return None, 0, 0, f"Test compilation error: {e}"
+        
+        # Step 3: Run tests with JaCoCo coverage
+        jacoco_exec = test_dir / "jacoco.exec"
+        if jacoco_exec.exists():
+            jacoco_exec.unlink()
+        
+        test_class_name = test_path.stem  # e.g., "CalculatorTest"
+        
+        # Use just "jacoco.exec" filename since cwd is test_dir
+        run_cmd = [
+            "java",
+            f"-javaagent:{jacoco_agent.absolute()}=destfile=jacoco.exec",
+            "-jar", str(junit_jar.absolute()),
+            "--class-path", base_classpath,
+            "--select-class", test_class_name
+        ]
+        
+        try:
+            result = subprocess.run(
+                run_cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=120,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = result.stdout + result.stderr
+            
+            if debug:
+                print(f"              [DEBUG] JUnit return code: {result.returncode}")
+                if result.returncode != 0:
+                    print(f"              [DEBUG] Output (last 500): {output[-500:]}")
+            
+            # Parse test counts from JUnit output
+            passed = 0
+            failed = 0
+            
+            # JUnit output format: "[        58 tests successful      ]"
+            # Need to handle variable whitespace
+            passed_match = re.search(r'\[\s*(\d+)\s+tests?\s+successful\s*\]', output)
+            failed_match = re.search(r'\[\s*(\d+)\s+tests?\s+failed\s*\]', output)
+            
+            if passed_match:
+                passed = int(passed_match.group(1))
+            if failed_match:
+                failed = int(failed_match.group(1))
+            
+            if debug:
+                print(f"              [DEBUG] Parsed tests: {passed} passed, {failed} failed")
+            
+            # Check for ACTUAL errors (not assertion failures)
+            # Assertion failures (expected vs actual) are expected behavior - tests ran successfully
+            # We only want to fix: compilation errors, NoClassDefFoundError, ClassNotFoundException, etc.
+            error_msg = None
+            if result.returncode != 0:
+                # If tests actually ran (passed > 0 or failed > 0), it's not a code error
+                tests_actually_ran = passed > 0 or failed > 0
+                
+                if not tests_actually_ran:
+                    # No tests ran - likely a compilation or setup error
+                    error_patterns = [
+                        r'(error:\s*cannot find symbol[^\n]+)',
+                        r'(error:\s*package [^\n]+ does not exist[^\n]*)',
+                        r'(error:\s*class [^\n]+ not found[^\n]*)',
+                        r'(Exception in thread[^\n]+)',
+                        r'(NoClassDefFoundError[^\n]+)',
+                        r'(ClassNotFoundException[^\n]+)',
+                        r'(NoSuchMethodError[^\n]+)',
+                        r'(IllegalAccessError[^\n]+)',
+                    ]
+                    for pattern in error_patterns:
+                        error_match = re.search(pattern, output, re.IGNORECASE)
+                        if error_match:
+                            error_msg = error_match.group(1)
+                            break
+                    
+                    # If no specific error found but no tests ran at all, there's likely a setup error
+                    if not error_msg:
+                        # Check it's not just an assertion failure message
+                        if "expected:" not in output.lower() or "but was:" not in output.lower():
+                            error_msg = output[-500:]
+                
+                if debug and error_msg:
+                    print(f"              [DEBUG] Detected fixable error: {error_msg[:100]}")
+            
+            # Step 4: Generate coverage report
+            coverage_pct = None
+            if jacoco_exec.exists() and jacoco_cli.exists():
+                csv_report = test_dir / "coverage.csv"
+                
+                # Remove old report if exists
+                if csv_report.exists():
+                    csv_report.unlink()
+                
+                # Find only the source class files (not JARs, not test classes)
+                class_files = [f.name for f in test_dir.glob("*.class") 
+                              if not f.name.endswith("Test.class") and not f.name.startswith("Test")]
+                
+                if debug:
+                    print(f"              [DEBUG] JaCoCo exec exists: {jacoco_exec.exists()}, size: {jacoco_exec.stat().st_size if jacoco_exec.exists() else 0}")
+                    print(f"              [DEBUG] Class files found: {class_files}")
+                
+                if class_files:
+                    # Build command with specific class files
+                    report_cmd = [
+                        "java", "-jar", str(jacoco_cli.absolute()),
+                        "report", "jacoco.exec",
+                        "--csv", "coverage.csv"
+                    ]
+                    # Add each class file
+                    for cf in class_files:
+                        report_cmd.extend(["--classfiles", cf])
+                    
+                    if debug:
+                        print(f"              [DEBUG] Running coverage report command...")
+                    
+                    try:
+                        cov_result = subprocess.run(
+                            report_cmd,
+                            capture_output=True,
+                            text=True,
+                            cwd=str(test_dir),
+                            timeout=30,
+                            encoding='utf-8',
+                            errors='replace'
+                        )
+                        
+                        if debug:
+                            print(f"              [DEBUG] Coverage report return code: {cov_result.returncode}")
+                            if cov_result.stderr:
+                                print(f"              [DEBUG] Coverage report stderr: {cov_result.stderr[:200]}")
+                        
+                        # Parse CSV for coverage
+                        if csv_report.exists():
+                            csv_content = csv_report.read_text(encoding='utf-8', errors='replace')
+                            if debug:
+                                print(f"              [DEBUG] Coverage CSV content: {csv_content[:300]}")
+                            
+                            lines = csv_content.strip().split('\n')
+                            if len(lines) > 1:
+                                # Parse header to find column indices
+                                header = lines[0].split(',')
+                                try:
+                                    class_idx = header.index('CLASS')
+                                    line_missed_idx = header.index('LINE_MISSED')
+                                    line_covered_idx = header.index('LINE_COVERED')
+                                    
+                                    for line in lines[1:]:  # Skip header
+                                        parts = line.split(',')
+                                        if len(parts) > max(class_idx, line_missed_idx, line_covered_idx):
+                                            csv_class = parts[class_idx]
+                                            if csv_class == class_name or class_name in csv_class:
+                                                missed = int(parts[line_missed_idx]) if parts[line_missed_idx].isdigit() else 0
+                                                covered = int(parts[line_covered_idx]) if parts[line_covered_idx].isdigit() else 0
+                                                total = missed + covered
+                                                if total > 0:
+                                                    coverage_pct = (covered / total) * 100
+                                                    if debug:
+                                                        print(f"              [DEBUG] Coverage for {csv_class}: {covered}/{total} = {coverage_pct:.1f}%")
+                                                break
+                                except ValueError as e:
+                                    if debug:
+                                        print(f"              [DEBUG] Could not find column in header: {e}")
+                        else:
+                            if debug:
+                                print(f"              [DEBUG] Coverage CSV not created")
+                    except Exception as e:
+                        if debug:
+                            print(f"              [DEBUG] Coverage report error: {e}")
+                else:
+                    if debug:
+                        print(f"              [DEBUG] No class files found for coverage")
+            
+            return coverage_pct or 0.0, passed, failed, error_msg
+            
+        except subprocess.TimeoutExpired:
+            return 0.0, 0, 0, "Timeout"
+        except Exception as e:
+            return 0.0, 0, 0, str(e)
+    
+    def _run_java_mutation(
+        self, 
+        source_file: Path, 
+        test_path: Path,
+        test_dir: Path, 
+        class_name: str,
+        junit_jar: Path,
+        external_jars: List[Path],
+        debug: bool
+    ) -> dict:
+        """Run mutation testing on a single Java file."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        source_in_test_dir = test_dir / source_file.name
+        if not source_in_test_dir.exists():
+            return results
+        
+        original_code = source_in_test_dir.read_text(encoding='utf-8', errors='replace')
+        
+        # Generate mutants
+        mutants = self._generate_java_mutants(original_code)
+        
+        if debug:
+            print(f"              [DEBUG] Generated {len(mutants)} mutants")
+        
+        # Classpath separator and build classpath
+        cp_sep = ";" if os.name == 'nt' else ":"
+        jar_paths = [str(test_dir)] + [str(j) for j in external_jars]
+        base_classpath = cp_sep.join(jar_paths)
+        
+        # Test each mutant (limit to 20)
+        mutants_to_test = mutants[:20]
+        for i, mutant_code in enumerate(mutants_to_test):
+            if debug:
+                print(f"              [DEBUG] Testing mutant {i+1}/{len(mutants_to_test)}...", end=" ", flush=True)
+            
+            killed = self._test_java_mutant(
+                source_in_test_dir, mutant_code, original_code,
+                test_path, test_dir, junit_jar, base_classpath, cp_sep
+            )
+            if killed:
+                results["killed"] += 1
+                if debug:
+                    print("killed")
+            else:
+                results["survived"] += 1
+                if debug:
+                    print("survived")
+        
+        results["total"] = len(mutants_to_test)
+        
+        return results
+    
+    def _generate_java_mutants(self, code: str) -> list:
+        """Generate mutants for Java code."""
+        mutants = []
+        
+        mutations = [
+            # Comparison operators
+            (r'==', '!='), (r'!=', '=='),
+            (r'<=', '>'), (r'>=', '<'),
+            (r'<(?!=)', '>='), (r'>(?!=)', '<='),
+            # Arithmetic operators
+            (r'\+(?!=)', '-'), (r'-(?!=)', '+'),
+            (r'\*(?!=)', '/'), (r'/(?!=)', '*'),
+            # Logical operators
+            (r'&&', '||'), (r'\|\|', '&&'),
+            # Boolean literals
+            (r'\btrue\b', 'false'), (r'\bfalse\b', 'true'),
+            # Null checks
+            (r'== null', '!= null'), (r'!= null', '== null'),
+            # Negation
+            (r'!(?!=)', ''),
+            # Increment/decrement
+            (r'\+\+', '--'), (r'--', '++'),
+        ]
+        
+        for pattern, replacement in mutations:
+            for match in re.finditer(pattern, code):
+                mutant = code[:match.start()] + replacement + code[match.end():]
+                if mutant != code:
+                    mutants.append(mutant)
+        
+        return mutants
+    
+    def _test_java_mutant(
+        self, 
+        source_path: Path, 
+        mutant_code: str, 
+        original_code: str, 
+        test_path: Path, 
+        test_dir: Path,
+        junit_jar: Path,
+        base_classpath: str,
+        cp_sep: str
+    ) -> bool:
+        """Test if a Java mutant is killed. Returns True if killed."""
+        # Apply mutant
+        source_path.write_text(mutant_code, encoding='utf-8')
+        
+        killed = True  # Default to killed on any error
+        
+        try:
+            # Recompile source (use filename since cwd is test_dir)
+            compile_result = subprocess.run(
+                ["javac", "-encoding", "UTF-8", "-cp", base_classpath, source_path.name],
+                capture_output=True,
+                cwd=str(test_dir),
+                timeout=15,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if compile_result.returncode != 0:
+                # Mutant doesn't compile - counts as killed
+                return True
+            
+            # Run tests
+            test_class_name = test_path.stem
+            run_result = subprocess.run(
+                [
+                    "java", "-jar", str(junit_jar.absolute()),
+                    "--class-path", base_classpath,
+                    "--select-class", test_class_name
+                ],
+                capture_output=True,
+                cwd=str(test_dir),
+                timeout=15,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            killed = run_result.returncode != 0
+        except subprocess.TimeoutExpired:
+            killed = True
+        except Exception:
+            killed = True
+        finally:
+            # Restore original and recompile
+            try:
+                source_path.write_text(original_code, encoding='utf-8')
+                subprocess.run(
+                    ["javac", "-encoding", "UTF-8", "-cp", base_classpath, source_path.name],
+                    capture_output=True,
+                    cwd=str(test_dir),
+                    timeout=15,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+            except:
+                pass
+        
+        return killed
     
     def _run_javascript_benchmark(
         self,
@@ -1222,17 +2103,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             print(f"              [DEBUG] Generated {len(mutants)} mutants")
         
         # Test each mutant (limit to 20)
-        for mutant_code in mutants[:20]:
+        mutants_to_test = mutants[:20]
+        for i, mutant_code in enumerate(mutants_to_test):
+            if debug:
+                print(f"              [DEBUG] Testing mutant {i+1}/{len(mutants_to_test)}...", end=" ", flush=True)
+            
             killed = self._test_javascript_mutant(
                 source_in_test_dir, mutant_code, original_code,
                 test_path, test_dir
             )
             if killed:
                 results["killed"] += 1
+                if debug:
+                    print("killed")
             else:
                 results["survived"] += 1
+                if debug:
+                    print("survived")
         
-        results["total"] = min(len(mutants), 20)
+        results["total"] = len(mutants_to_test)
         
         return results
     
@@ -1283,23 +2172,33 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         # Use correct command for Windows vs Unix
         npx_cmd = "npx.cmd" if os.name == 'nt' else "npx"
         
+        killed = True  # Default to killed (safer assumption on timeout/error)
+        
         try:
+            # Use shorter timeout (15s) and --testTimeout to limit Jest internally
             result = subprocess.run(
-                [npx_cmd, "jest", test_path.name, "--no-cache", "--silent"],
+                [npx_cmd, "jest", test_path.name, "--no-cache", "--silent", "--testTimeout=10000", "--forceExit"],
                 capture_output=True,
                 text=True,
                 cwd=str(test_dir),
-                timeout=30,
-                shell=(os.name == 'nt'),  # Use shell on Windows
+                timeout=15,  # Shorter timeout
+                shell=(os.name == 'nt'),
                 encoding='utf-8',
                 errors='replace'
             )
             killed = result.returncode != 0
-        except:
+        except subprocess.TimeoutExpired:
+            # Timeout means mutant likely caused infinite loop - count as killed
+            killed = True
+        except Exception:
+            # Any other error - count as killed
             killed = True
         finally:
-            # Restore original
-            source_path.write_text(original_code, encoding='utf-8')
+            # Always restore original
+            try:
+                source_path.write_text(original_code, encoding='utf-8')
+            except:
+                pass
         
         return killed
     
