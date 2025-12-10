@@ -1495,56 +1495,6 @@ module.exports = {{
                     "error": result.stderr or ""
                 })
 
-
-def print_measurement_report(measurement: CreationMeasurement):
-    """Print a formatted measurement report."""
-    print("\n" + "=" * 60)
-    print(f"TEST CREATION MEASUREMENT REPORT")
-    print(f"Bot: {measurement.bot_name}")
-    print(f"Language: {measurement.language}")
-    print(f"Project: {measurement.project_name}")
-    print("=" * 60)
-    
-    print(f"\n📁 SOURCE CODE:")
-    print(f"   Files: {measurement.source_files_count}")
-    print(f"   Lines of Code: {measurement.source_loc:,}")
-    
-    print(f"\n🧪 GENERATED TESTS:")
-    print(f"   Test Files Created: {measurement.test_files_created}")
-    print(f"   Test Lines of Code: {measurement.test_loc:,}")
-    print(f"   Generation Time: {measurement.generation_time_seconds:.2f}s")
-    
-    print(f"\n✅ COMPILATION:")
-    print(f"   Compilable: {measurement.tests_compilable}/{measurement.tests_generated}")
-    print(f"   Compilation Rate: {measurement.compilation_rate:.1%}")
-    if measurement.compilation_errors:
-        print(f"   Errors: {len(measurement.compilation_errors)}")
-    
-    print(f"\n🏃 EXECUTION:")
-    print(f"   Passing: {measurement.tests_passing}")
-    print(f"   Failing: {measurement.tests_failing}")
-    print(f"   Erroring: {measurement.tests_erroring}")
-    print(f"   Pass Rate: {measurement.pass_rate:.1%}")
-    
-    print(f"\n📊 COVERAGE:")
-    print(f"   Line Coverage: {measurement.line_coverage:.1f}%")
-    print(f"   Branch Coverage: {measurement.branch_coverage:.1f}%")
-    
-    print(f"\n🎯 ASSERTION QUALITY:")
-    print(f"   Total Assertions: {measurement.total_assertions}")
-    print(f"   Tests with Assertions: {measurement.tests_with_assertions}")
-    print(f"   Avg Assertions/Test: {measurement.avg_assertions_per_test:.1f}")
-    
-    print(f"\n🔍 QUALITY INDICATORS:")
-    print(f"   Edge Case Tests: {'✓' if measurement.has_edge_cases else '✗'}")
-    print(f"   Error Handling Tests: {'✓' if measurement.has_error_handling_tests else '✗'}")
-    print(f"   Boundary Tests: {'✓' if measurement.has_boundary_tests else '✗'}")
-    print(f"   Test Naming Quality: {measurement.test_naming_quality:.1%}")
-    
-    print(f"\n⭐ OVERALL SCORE: {measurement.get_score()}/100")
-    print("=" * 60)
-
-
 if __name__ == "__main__":
     # Example usage with a mock bot
     def mock_test_generator(source_code: str) -> str:
