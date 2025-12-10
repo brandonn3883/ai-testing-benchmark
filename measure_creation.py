@@ -42,6 +42,9 @@ class CreationMeasurement:
     line_coverage: float = 0.0
     branch_coverage: float = 0.0
     
+    # Per-file coverage: dict mapping filename to coverage percentage
+    per_file_coverage: dict = None
+    
     # Supporting info
     tests_compilable: int = 0
     tests_passing: int = 0
@@ -51,6 +54,8 @@ class CreationMeasurement:
     def __post_init__(self):
         if self.compilation_errors is None:
             self.compilation_errors = []
+        if self.per_file_coverage is None:
+            self.per_file_coverage = {}
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,10 +98,18 @@ class TestCreationMeasurer:
         project_path: str,
         generate_tests: Callable[[str, str], str],
         project_name: str = "unnamed",
-        debug: bool = False
+        debug: bool = False,
+        fix_tests: Callable[[str, str, str], str] = None  # Optional function to fix broken tests
     ) -> CreationMeasurement:
         """
         Measure test creation for a Python project.
+        
+        Flow for each source file:
+        1. Generate test
+        2. Run coverage
+        3. If error, fix the test (up to 3 attempts)
+        4. Record per-file coverage
+        5. Move to next file
         
         Args:
             bot_name: Name of the AI bot
@@ -104,6 +117,7 @@ class TestCreationMeasurer:
             generate_tests: Function that takes (source_code, module_name) and returns generated tests
             project_name: Name of the project being tested
             debug: Enable debug output
+            fix_tests: Optional function that takes (test_code, error_message, source_code) and returns fixed test code
         """
         measurement = CreationMeasurement(
             bot_name=bot_name,
@@ -113,47 +127,272 @@ class TestCreationMeasurer:
         
         project_path = Path(project_path)
         
-        # Count source files
-        source_files = list(project_path.rglob("*.py"))
-        source_files = [f for f in source_files if not f.name.startswith("test_")]
-        measurement.source_files_count = len(source_files)
+        # Find all source files (including private ones for copying)
+        all_source_files = list(project_path.rglob("*.py"))
+        all_source_files = [f for f in all_source_files if not f.name.startswith("test_")]
+        
+        # Files to generate tests for (exclude __init__.py and _private.py files)
+        testable_files = [f for f in all_source_files 
+                         if f.name != "__init__.py" and not f.name.startswith("_")]
+        
+        measurement.source_files_count = len(testable_files)
         
         if debug:
-            print(f"    [DEBUG] Found {len(source_files)} source files")
+            print(f"    [DEBUG] Found {len(all_source_files)} source files, {len(testable_files)} testable")
+            excluded = [f.name for f in all_source_files if f not in testable_files]
+            if excluded:
+                print(f"    [DEBUG] Excluded from testing: {excluded}")
         
-        # Create test output directory - clean it first to remove files from previous projects
+        # Create test output directory - clean it first
         test_output_dir = self.work_dir / "generated_tests"
         if test_output_dir.exists():
             shutil.rmtree(test_output_dir)
         test_output_dir.mkdir(exist_ok=True)
         
-        # Generate tests for each source file
+        # Copy ALL source files to test directory (with relative imports fixed)
+        for src_file in all_source_files:
+            content = src_file.read_text(encoding='utf-8', errors='replace')
+            content = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', content)
+            content = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', content)
+            dest_file = test_output_dir / src_file.name
+            dest_file.write_text(content, encoding='utf-8')
+        
+        # Build dependency context map
+        module_contents = {}
+        for sf in all_source_files:
+            module_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
         start_time = time.time()
         
-        for source_file in source_files:
+        # Process each source file individually
+        for source_file in testable_files:
             source_code = source_file.read_text(encoding='utf-8', errors='replace')
-            module_name = source_file.stem  # e.g., "slugify" from "slugify.py"
+            module_name = source_file.stem
+            test_filename = f"test_{module_name}.py"
+            test_path = test_output_dir / test_filename
             
+            print(f"    Processing: {source_file.name}")
+            
+            # Build context with dependencies
+            code_with_context = self._build_python_context(
+                source_code, module_name, module_contents, all_source_files, source_file
+            )
+            
+            # Step 1: Generate test
             try:
-                generated_test = generate_tests(source_code, module_name)
+                generated_test = generate_tests(code_with_context, module_name)
+                if not generated_test:
+                    print(f"      No test generated for {source_file.name}")
+                    continue
+                    
+                test_path.write_text(generated_test, encoding='utf-8')
+                measurement.test_files_created += 1
                 
-                if generated_test:
-                    # Save generated test
-                    test_filename = f"test_{source_file.stem}.py"
-                    test_path = test_output_dir / test_filename
-                    test_path.write_text(generated_test, encoding='utf-8')
-                    measurement.test_files_created += 1
-                    print(f"    Generated: {test_filename}")
+                if debug:
+                    print(f"      [DEBUG] Generated {test_filename}")
                     
             except Exception as e:
-                print(f"Error generating test for {source_file}: {e}")
+                print(f"      Error generating test: {e}")
+                continue
+            
+            # Step 2: Run coverage for this single file
+            file_coverage, error_msg = self._run_single_file_coverage(
+                test_path, source_file.name, test_output_dir, debug
+            )
+            
+            # Step 3: If error and we have a fix function, try to fix
+            if error_msg and fix_tests:
+                if debug:
+                    print(f"      [DEBUG] Test has errors, attempting fix...")
+                
+                for attempt in range(3):  # Up to 3 fix attempts
+                    try:
+                        fixed_test = fix_tests(
+                            test_path.read_text(encoding='utf-8', errors='replace'),
+                            error_msg,
+                            source_code
+                        )
+                        if fixed_test:
+                            test_path.write_text(fixed_test, encoding='utf-8')
+                            
+                            # Re-run coverage
+                            file_coverage, error_msg = self._run_single_file_coverage(
+                                test_path, source_file.name, test_output_dir, debug
+                            )
+                            
+                            if not error_msg:
+                                if debug:
+                                    print(f"      [DEBUG] Fixed on attempt {attempt + 1}")
+                                break
+                    except Exception as e:
+                        if debug:
+                            print(f"      [DEBUG] Fix attempt {attempt + 1} failed: {e}")
+            
+            # Step 4: Record coverage for this file
+            if file_coverage is not None:
+                measurement.per_file_coverage[source_file.name] = round(file_coverage, 2)
+                print(f"      Coverage: {file_coverage:.1f}%")
+                measurement.tests_passing += 1
+            else:
+                measurement.per_file_coverage[source_file.name] = 0.0
+                measurement.tests_failed += 1
+                if error_msg:
+                    print(f"      Error: {error_msg[:100]}...")
         
         measurement.generation_time_seconds = time.time() - start_time
         
-        # Analyze generated tests
-        self._analyze_python_tests(measurement, project_path, test_output_dir, debug)
+        # Calculate overall coverage (average of per-file)
+        if measurement.per_file_coverage:
+            measurement.line_coverage = sum(measurement.per_file_coverage.values()) / len(measurement.per_file_coverage)
+        
+        measurement.tests_compilable = measurement.test_files_created
         
         return measurement
+    
+    def _build_python_context(
+        self, 
+        source_code: str, 
+        module_name: str, 
+        module_contents: dict, 
+        all_source_files: list,
+        source_file: Path
+    ) -> str:
+        """Build source code with dependency context for AI."""
+        # Find local imports
+        imports = []
+        for match in re.finditer(r'(?:from\s+(\w+)\s+import|^import\s+(\w+))', source_code, re.MULTILINE):
+            module = match.group(1) or match.group(2)
+            if module:
+                imports.append(module)
+        
+        # Add dependency code
+        dependency_code = ""
+        for imp in imports:
+            if imp in module_contents and imp != module_name:
+                dep_content = module_contents[imp]
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n# ... (truncated)"
+                dependency_code += f"\n\n# === DEPENDENCY: {imp}.py ===\n{dep_content}"
+        
+        if dependency_code:
+            return source_code + "\n\n# === PROJECT DEPENDENCIES (for reference) ===" + dependency_code
+        elif len(all_source_files) > 1:
+            other_files = [sf.name for sf in all_source_files if sf != source_file]
+            if other_files:
+                return source_code + f"\n\n# NOTE: This project also contains: {', '.join(other_files)}"
+        
+        return source_code
+    
+    def _run_single_file_coverage(
+        self,
+        test_path: Path,
+        source_filename: str,
+        test_dir: Path,
+        debug: bool = False
+    ) -> tuple:
+        """
+        Run coverage for a single test file against its source file.
+        
+        Returns:
+            (coverage_percentage, error_message) - error_message is None if successful
+        """
+        import json
+        
+        source_name = Path(source_filename).stem  # e.g., "errors" from "errors.py"
+        
+        # Fix imports in test file
+        test_content = test_path.read_text(encoding='utf-8', errors='replace')
+        original = test_content
+        test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
+        test_content = re.sub(r'from\s+(\w+)\.errors\s+import', r'from errors import', test_content)
+        test_content = re.sub(r'from\s+(\w+)\._regex\s+import', r'from _regex import', test_content)
+        if test_content != original:
+            test_path.write_text(test_content, encoding='utf-8')
+        
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(test_dir)
+        
+        # Run pytest with coverage on just this source file
+        coverage_json = test_dir / "coverage.json"
+        if coverage_json.exists():
+            coverage_json.unlink()
+        
+        # Use just the filename since we run from test_dir
+        test_filename = test_path.name
+        
+        # Verify test file exists
+        if not test_path.exists():
+            return None, f"Test file not found: {test_path}"
+        
+        cmd = [
+            "python", "-m", "pytest",
+            test_filename,
+            f"--cov={source_name}",
+            "--cov-report=json:coverage.json",
+            "--cov-report=term",
+            "-v", "--tb=short"
+        ]
+        
+        if debug:
+            print(f"      [DEBUG] Running: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                env=env,
+                timeout=120
+            )
+            
+            output = result.stdout + result.stderr
+            
+            if debug:
+                print(f"      [DEBUG] pytest return code: {result.returncode}")
+                if result.returncode != 0:
+                    print(f"      [DEBUG] Output: {output[-500:]}")
+            
+            # Check for errors
+            if "error" in output.lower() and result.returncode != 0:
+                # Extract error message
+                error_match = re.search(r'(Error|Exception|ImportError|SyntaxError)[^\n]+', output)
+                error_msg = error_match.group(0) if error_match else output[-200:]
+                return None, error_msg
+            
+            # Parse coverage
+            coverage_pct = None
+            
+            # Try JSON first
+            coverage_json = test_dir / "coverage.json"
+            if coverage_json.exists():
+                try:
+                    with open(coverage_json, encoding='utf-8') as f:
+                        cov_data = json.load(f)
+                        totals = cov_data.get("totals", {})
+                        coverage_pct = totals.get("percent_covered", 0.0)
+                    coverage_json.unlink()
+                except Exception as e:
+                    if debug:
+                        print(f"      [DEBUG] Error parsing coverage.json: {e}")
+            
+            # Fallback to terminal output
+            if coverage_pct is None:
+                cov_match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', output)
+                if cov_match:
+                    coverage_pct = float(cov_match.group(1))
+            
+            # Cleanup
+            dotcoverage = test_dir / ".coverage"
+            if dotcoverage.exists():
+                dotcoverage.unlink()
+            
+            return coverage_pct if coverage_pct is not None else 0.0, None
+            
+        except subprocess.TimeoutExpired:
+            return None, "Test timed out"
+        except Exception as e:
+            return None, str(e)
     
     def _analyze_python_tests(
         self,
@@ -227,18 +466,42 @@ class TestCreationMeasurer:
             return
         
         # Copy source files to test directory so imports work
-        # Also fix imports in test files
+        # Also fix relative imports to work without package structure
         for src_file in source_files:
-            shutil.copy(src_file, test_dir / src_file.name)
+            content = src_file.read_text(encoding='utf-8', errors='replace')
+            
+            # Fix relative imports: from .module import -> from module import
+            # Also handle: from ._module import -> from _module import
+            content = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', content)
+            
+            # Fix relative imports with submodules: from .pkg.module import -> from pkg.module import  
+            content = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', content)
+            
+            # Fix import . statements: import .module -> import module (rare but possible)
+            content = re.sub(r'^import\s+\.(\w+)', r'import \1', content, flags=re.MULTILINE)
+            
+            dest_file = test_dir / src_file.name
+            dest_file.write_text(content, encoding='utf-8')
+            
             if debug:
                 print(f"    [DEBUG] Copied {src_file.name} to test dir")
         
         # Fix imports in test files - replace "from src.X import" with "from X import"
+        # Also fix any relative imports the AI might have generated
         for test_file in test_dir.glob("test_*.py"):
             test_content = test_file.read_text(encoding='utf-8', errors='replace')
-            fixed_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
-            if fixed_content != test_content:
-                test_file.write_text(fixed_content, encoding='utf-8')
+            original = test_content
+            
+            # Fix src.module imports
+            test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
+            
+            # Fix module.submodule imports that reference package structure
+            # e.g., from manipulation.errors import -> from errors import
+            test_content = re.sub(r'from\s+(\w+)\.errors\s+import', r'from errors import', test_content)
+            test_content = re.sub(r'from\s+(\w+)\._regex\s+import', r'from _regex import', test_content)
+            
+            if test_content != original:
+                test_file.write_text(test_content, encoding='utf-8')
                 if debug:
                     print(f"    [DEBUG] Fixed imports in {test_file.name}")
         
@@ -276,7 +539,7 @@ class TestCreationMeasurer:
                 "python", "-m", "pytest",
                 ".",
                 f"--cov={cov_sources}",
-                "--cov-report=json",
+                "--cov-report=json:coverage.json",  # Explicit output file
                 "--cov-report=term",
                 "-v", "--tb=short"
             ]
@@ -310,19 +573,41 @@ class TestCreationMeasurer:
             error_count = int(error.group(1)) if error else 0
             measurement.tests_failed = failed_count + error_count
             
-            # Parse coverage from terminal output as backup
-            # Look for pattern like "TOTAL    100     20    80%"
+            # Parse coverage from terminal output
+            # pytest-cov terminal output format:
+            # Name                 Stmts   Miss  Cover
+            # ----------------------------------------
+            # errors.py               10      0   100%
+            # manipulation.py        200     10    95%
+            # TOTAL                   210     10    95%
+            
+            # First, try to get per-file coverage from terminal output
+            # Pattern: filename.py    Stmts   Miss   Cover%
+            file_cov_pattern = re.compile(r'^(\w+\.py)\s+\d+\s+\d+\s+(\d+)%', re.MULTILINE)
+            for match in file_cov_pattern.finditer(output):
+                filename = match.group(1)
+                file_coverage = float(match.group(2))
+                if not filename.startswith("test_"):
+                    measurement.per_file_coverage[filename] = file_coverage
+                    if debug:
+                        print(f"    [DEBUG] Per-file from terminal: {filename} = {file_coverage}%")
+            
+            # Get total coverage from terminal
             cov_match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", output)
             if cov_match:
                 measurement.line_coverage = float(cov_match.group(1))
                 if debug:
                     print(f"    [DEBUG] Coverage from terminal: {measurement.line_coverage}%")
             
-            # Try to parse coverage.json
+            # Try to parse coverage.json for more detailed data (will override terminal if successful)
             coverage_file = test_dir / "coverage.json"
             if coverage_file.exists():
                 with open(coverage_file, encoding='utf-8') as f:
                     cov_data = json.load(f)
+                    
+                    if debug:
+                        print(f"    [DEBUG] coverage.json keys: {list(cov_data.keys())}")
+                    
                     totals = cov_data.get("totals", {})
                     if debug:
                         print(f"    [DEBUG] coverage.json totals: {totals}")
@@ -330,6 +615,29 @@ class TestCreationMeasurer:
                         measurement.line_coverage = totals.get("percent_covered", 0.0)
                     if totals.get("percent_covered_branches"):
                         measurement.branch_coverage = totals.get("percent_covered_branches", 0.0)
+                    
+                    # Extract per-file coverage
+                    # pytest-cov format: {"files": {"path/to/file.py": {"summary": {"percent_covered": X}}}}
+                    files = cov_data.get("files", {})
+                    if debug:
+                        print(f"    [DEBUG] coverage.json has {len(files)} files")
+                        if files:
+                            first_key = list(files.keys())[0]
+                            print(f"    [DEBUG] First file key: {first_key}")
+                            print(f"    [DEBUG] First file data: {files[first_key]}")
+                    
+                    for filepath, file_data in files.items():
+                        filename = Path(filepath).name
+                        # Only include source files, not test files
+                        if not filename.startswith("test_"):
+                            summary = file_data.get("summary", {})
+                            file_coverage = summary.get("percent_covered", 0.0)
+                            measurement.per_file_coverage[filename] = round(file_coverage, 2)
+                            if debug:
+                                print(f"    [DEBUG] Added per-file: {filename} = {file_coverage}%")
+                    
+                    if debug:
+                        print(f"    [DEBUG] Final per_file_coverage: {measurement.per_file_coverage}")
                 
                 # Cleanup coverage files
                 coverage_file.unlink()
@@ -423,6 +731,11 @@ class TestCreationMeasurer:
         for source_file in source_files:
             shutil.copy(source_file, main_java / source_file.name)
         
+        # Create a map of class name to file content for dependency resolution
+        class_contents = {}
+        for sf in source_files:
+            class_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
         # Generate tests
         start_time = time.time()
         
@@ -431,8 +744,35 @@ class TestCreationMeasurer:
             # Pass the class name (filename without extension) as module_name
             module_name = source_file.stem  # e.g., "Slugify" from "Slugify.java"
             
+            # Find what classes this file references from the project
+            # Look for: new ClassName, ClassName.method, extends ClassName, implements ClassName
+            referenced_classes = set()
+            for class_name in class_contents.keys():
+                if class_name != module_name:
+                    # Check if this class is referenced in the source
+                    if re.search(rf'\b{class_name}\b', source_code):
+                        referenced_classes.add(class_name)
+            
+            # Build dependency code context
+            dependency_code = ""
+            for dep_class in referenced_classes:
+                dep_content = class_contents[dep_class]
+                # Truncate very long dependencies
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n// ... (truncated)"
+                dependency_code += f"\n\n// === DEPENDENCY: {dep_class}.java ===\n{dep_content}"
+            
+            # Build the full context
+            code_with_context = source_code
+            if dependency_code:
+                code_with_context = source_code + "\n\n// === PROJECT DEPENDENCIES (for reference) ===" + dependency_code
+            elif len(source_files) > 1:
+                other_files = [sf.stem for sf in source_files if sf != source_file]
+                if other_files:
+                    code_with_context = source_code + f"\n\n// NOTE: This project also contains these classes: {', '.join(other_files)}"
+            
             try:
-                generated_test = generate_tests(source_code, module_name)
+                generated_test = generate_tests(code_with_context, module_name)
                 
                 if generated_test:
                     # Extract code from markdown if present
@@ -669,12 +1009,20 @@ class TestCreationMeasurer:
                         print(f"    [DEBUG] Row has {len(parts)} columns, class={parts[2] if len(parts) > 2 else 'N/A'}")
                     if len(parts) >= 9:  # Need at least 9 columns (0-8)
                         try:
+                            class_name = parts[2]  # CLASS column
                             missed = int(parts[7])  # LINE_MISSED
                             covered = int(parts[8])  # LINE_COVERED
                             total_missed += missed
                             total_covered += covered
+                            
+                            # Per-file coverage
+                            file_total = missed + covered
+                            if file_total > 0:
+                                file_coverage = (covered / file_total) * 100
+                                measurement.per_file_coverage[f"{class_name}.java"] = round(file_coverage, 2)
+                            
                             if debug:
-                                print(f"    [DEBUG] Class {parts[2]}: missed={missed}, covered={covered}")
+                                print(f"    [DEBUG] Class {class_name}: missed={missed}, covered={covered}")
                         except (ValueError, IndexError) as e:
                             if debug:
                                 print(f"    [DEBUG] Parse error: {e}")
@@ -684,6 +1032,8 @@ class TestCreationMeasurer:
                     measurement.line_coverage = (total_covered / total) * 100
                     if debug:
                         print(f"    [DEBUG] Total coverage: {total_covered}/{total} = {measurement.line_coverage:.1f}%")
+                        if measurement.per_file_coverage:
+                            print(f"    [DEBUG] Per-file coverage: {measurement.per_file_coverage}")
                 elif debug:
                     print(f"    [DEBUG] No coverage data found (total=0)")
             
@@ -789,6 +1139,11 @@ class TestCreationMeasurer:
             shutil.rmtree(test_output_dir)
         test_output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Create a map of module name to file content for dependency resolution
+        module_contents = {}
+        for sf in source_files:
+            module_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
         # Generate tests
         start_time = time.time()
         
@@ -797,8 +1152,35 @@ class TestCreationMeasurer:
             # Pass the filename (without extension) as module_name for correct imports
             module_name = source_file.stem  # e.g., "camelCase" from "camelCase.js"
             
+            # Find what modules this file requires from the project
+            # Look for: require('./module') or import from './module'
+            required_modules = set()
+            for mod_name in module_contents.keys():
+                if mod_name != module_name:
+                    # Check for require or import of this module
+                    if re.search(rf"(?:require\s*\(\s*['\"]\./{mod_name}|from\s+['\"]\./{mod_name})", source_code):
+                        required_modules.add(mod_name)
+            
+            # Build dependency code context
+            dependency_code = ""
+            for dep_mod in required_modules:
+                dep_content = module_contents[dep_mod]
+                # Truncate very long dependencies
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n// ... (truncated)"
+                dependency_code += f"\n\n// === DEPENDENCY: {dep_mod}.js ===\n{dep_content}"
+            
+            # Build the full context
+            code_with_context = source_code
+            if dependency_code:
+                code_with_context = source_code + "\n\n// === PROJECT DEPENDENCIES (for reference) ===" + dependency_code
+            elif len(source_files) > 1:
+                other_files = [sf.stem for sf in source_files if sf != source_file]
+                if other_files:
+                    code_with_context = source_code + f"\n\n// NOTE: This project also contains these modules: {', '.join(other_files)}"
+            
             try:
-                generated_test = generate_tests(source_code, module_name)
+                generated_test = generate_tests(code_with_context, module_name)
                 
                 if generated_test:
                     # Extract code from markdown if present
@@ -1057,8 +1439,21 @@ module.exports = {{
                         # pct is "Unknown" or some other string
                         measurement.line_coverage = 0.0
                     
+                    # Extract per-file coverage
+                    for filepath, file_data in coverage_data.items():
+                        if filepath != "total":
+                            filename = Path(filepath).name
+                            # Only include source files, not test files
+                            if not filename.endswith(".test.js") and not filename.endswith(".spec.js"):
+                                file_lines = file_data.get("lines", {})
+                                file_pct = file_lines.get("pct", 0)
+                                if isinstance(file_pct, (int, float)):
+                                    measurement.per_file_coverage[filename] = round(float(file_pct), 2)
+                    
                     if debug:
                         print(f"    [DEBUG] Coverage: {measurement.line_coverage:.1f}%")
+                        if measurement.per_file_coverage:
+                            print(f"    [DEBUG] Per-file coverage: {measurement.per_file_coverage}")
                 
                 # Cleanup coverage directory
                 coverage_dir = test_dir / "coverage"

@@ -4,16 +4,30 @@ AI Testing Bot Benchmark Runner
 
 Benchmarks ChatGPT, Claude, and Gemini for test generation, execution, and maintenance.
 
+Per-file flow:
+1. Generate test for 1 file
+2. Run coverage
+3. If error, fix that file (maintenance)
+4. If no error, run mutation testing (execution)
+5. Write metrics for that file
+6. Move to next file
+
 Usage:
     python run_benchmark.py --bot chatgpt --language python --project ./src
-    python run_benchmark.py --all --language python --project ./src
+    python run_benchmark.py --bot all --language python --project ./src
 """
 
 import argparse
+import os
+import re
 import json
-import sys
+import shutil
+import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from typing import Callable, List, Optional
 
 # Load .env file
 try:
@@ -23,23 +37,52 @@ except ImportError:
     pass
 
 from llm_bots import create_bot, get_available_bots, BotInterface
-from measure_creation import TestCreationMeasurer
-from measure_execution import TestExecutionMeasurer
-from measure_maintenance import TestMaintenanceMeasurer
-from generate_report import CSVReportGenerator
+
+
+@dataclass
+class FileResult:
+    """Results for a single source file through the entire pipeline."""
+    # Identification
+    bot_name: str
+    language: str
+    project_name: str
+    file_name: str
+    timestamp: str = ""
+    
+    # Creation metrics
+    test_generated: bool = False
+    generation_time_seconds: float = 0.0
+    line_coverage_pct: float = 0.0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    
+    # Maintenance metrics
+    had_errors: bool = False
+    errors_fixed: bool = False
+    errors_remain: bool = False
+    fix_attempts: int = 0
+    first_attempt_fix: bool = False
+    
+    # Execution metrics (mutation testing)
+    mutation_score_pct: float = 0.0
+    mutants_total: int = 0
+    mutants_killed: int = 0
+    mutants_survived: int = 0
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now().isoformat()
 
 
 class BenchmarkRunner:
-    """Runs benchmarks on AI testing bots."""
+    """Runs per-file benchmarks on AI testing bots."""
     
     def __init__(self, output_dir: str = "./benchmark_results"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.creation_measurer = TestCreationMeasurer(str(self.output_dir / "work_creation"))
-        self.execution_measurer = TestExecutionMeasurer(str(self.output_dir / "work_execution"))
-        self.maintenance_measurer = TestMaintenanceMeasurer(str(self.output_dir / "work_maintenance"))
-        self.report_generator = CSVReportGenerator(str(self.output_dir))
+        self.work_dir = self.output_dir / "work"
+        self.work_dir.mkdir(exist_ok=True)
+        self.results: List[FileResult] = []
     
     def run_benchmark(
         self,
@@ -47,50 +90,25 @@ class BenchmarkRunner:
         project_path: str,
         language: str,
         project_name: str = None,
-        run_creation: bool = True,
-        run_execution: bool = True,
-        run_maintenance: bool = True,
         verbose: bool = True,
         debug: bool = False
-    ) -> dict:
+    ) -> List[FileResult]:
         """
-        Run benchmark on a single bot.
+        Run per-file benchmark on a project.
         
-        Args:
-            bot: The bot to benchmark
-            project_path: Path to source code
-            language: python, java, or javascript
-            project_name: Name for reporting
-            run_creation: Run test creation benchmark
-            run_execution: Run test execution benchmark
-            run_maintenance: Run test maintenance benchmark
-            verbose: Print progress
-            debug: Enable debug output
+        For each source file:
+        1. Generate test
+        2. Run coverage
+        3. If error, fix (maintenance)
+        4. If no error, run mutation testing (execution)
+        5. Record all metrics
         """
+        project_path = Path(project_path).resolve()
+        
         if project_name is None:
-            # Derive project name from path, but handle common patterns
-            path = Path(project_path).resolve()
-            name = path.name
-            
-            # If the directory is named "src", "lib", or "source", use parent directory name
-            if name.lower() in ("src", "lib", "source", "main", "app"):
-                name = path.parent.name
-            
-            # If still generic, try going up one more level
-            if name.lower() in ("src", "lib", "source", "main", "app", "python", "java", "javascript"):
-                name = path.parent.parent.name
-            
-            project_name = name
-        
-        result = {
-            "bot_name": bot.name,
-            "language": language,
-            "project_name": project_name,
-            "timestamp": datetime.now().isoformat(),
-            "creation": None,
-            "execution": None,
-            "maintenance": None
-        }
+            project_name = project_path.name
+            if project_name.lower() in ("src", "lib", "source", "main", "app"):
+                project_name = project_path.parent.name
         
         if verbose:
             print(f"\n{'='*60}")
@@ -99,323 +117,585 @@ class BenchmarkRunner:
             print(f"Language: {language}")
             print(f"{'='*60}")
         
-        generated_test_dir = self.output_dir / "work_creation" / "generated_tests"
+        if language == "python":
+            return self._run_python_benchmark(
+                bot, project_path, project_name, verbose, debug
+            )
+        elif language == "java":
+            return self._run_java_benchmark(
+                bot, project_path, project_name, verbose, debug
+            )
+        elif language == "javascript":
+            return self._run_javascript_benchmark(
+                bot, project_path, project_name, verbose, debug
+            )
+        else:
+            print(f"Unsupported language: {language}")
+            return []
+    
+    def _run_python_benchmark(
+        self,
+        bot: BotInterface,
+        project_path: Path,
+        project_name: str,
+        verbose: bool,
+        debug: bool
+    ) -> List[FileResult]:
+        """Run per-file benchmark for Python."""
         
-        # Phase 1: Test Creation
-        if run_creation:
-            if verbose:
-                print("\n[1/3] Test Creation...")
-            try:
-                # Create a wrapper that passes the correct language to generate_tests
-                # Python passes (code, module_name), Java/JS pass just (code)
-                def make_generator(lang):
-                    return lambda code, module_name=None: bot.generate_tests(code, module_name=module_name, language=lang)
-                
-                if language == "python":
-                    result["creation"] = self.creation_measurer.measure_python(
-                        bot_name=bot.name,
-                        project_path=project_path,
-                        generate_tests=make_generator("python"),
-                        project_name=project_name,
-                        debug=debug
-                    )
-                elif language == "java":
-                    result["creation"] = self.creation_measurer.measure_java(
-                        bot_name=bot.name,
-                        project_path=project_path,
-                        generate_tests=make_generator("java"),
-                        project_name=project_name,
-                        debug=debug
-                    )
-                elif language == "javascript":
-                    result["creation"] = self.creation_measurer.measure_javascript(
-                        bot_name=bot.name,
-                        project_path=project_path,
-                        generate_tests=make_generator("javascript"),
-                        project_name=project_name,
-                        debug=debug
-                    )
-                if verbose and result["creation"]:
-                    print(f"    Coverage: {result['creation'].line_coverage:.1f}%")
-            except Exception as e:
-                print(f"    Error: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
+        # Find all source files
+        all_source_files = list(project_path.rglob("*.py"))
+        all_source_files = [f for f in all_source_files if not f.name.startswith("test_")]
         
-        # Phase 2: Test Maintenance (fix broken tests before mutation testing)
-        if run_maintenance:
-            if verbose:
-                print("\n[2/3] Test Maintenance...")
-            try:
-                if generated_test_dir.exists():
-                    if language == "python":
-                        result["maintenance"] = self.maintenance_measurer.measure_python(
-                            bot_name=bot.name,
-                            repair_function=bot.repair_test,
-                            test_dir=str(generated_test_dir),
-                            source_dir=project_path,
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    elif language == "java":
-                        result["maintenance"] = self.maintenance_measurer.measure_java(
-                            bot_name=bot.name,
-                            repair_function=bot.repair_test,
-                            test_dir=str(generated_test_dir),
-                            source_dir=project_path,
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    elif language == "javascript":
-                        result["maintenance"] = self.maintenance_measurer.measure_javascript(
-                            bot_name=bot.name,
-                            repair_function=bot.repair_test,
-                            test_dir=str(generated_test_dir),
-                            source_dir=project_path,
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    
-                    if verbose and result["maintenance"]:
-                        m = result["maintenance"]
-                        if m.total_broken_tests == 0:
-                            print(f"    No errors to fix (all tests pass)")
-                        else:
-                            print(f"    Fixed: {m.successful_repairs}/{m.total_broken_tests} ({m.get_fix_percentage():.1f}%)")
-                            if m.successful_repairs > 0:
-                                print(f"    First-attempt fixes: {m.first_attempt_fixes}/{m.successful_repairs}")
-                                avg = m.get_avg_attempts_per_fix()
-                                if avg:
-                                    print(f"    Avg attempts per fix: {avg:.1f}")
-                                
-                                # Re-analyze coverage after fixes
-                                if verbose:
-                                    print("    Re-analyzing coverage after fixes...")
-                                new_coverage = self._reanalyze_coverage(
-                                    language, generated_test_dir, project_path, debug
-                                )
-                                if new_coverage is not None and result["creation"]:
-                                    old_coverage = result["creation"].line_coverage
-                                    result["creation"].line_coverage = new_coverage
-                                    if verbose:
-                                        print(f"    Coverage: {old_coverage:.1f}% -> {new_coverage:.1f}%")
-                else:
-                    if verbose:
-                        print("    Skipped (no generated tests)")
-            except Exception as e:
-                print(f"    Error: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
+        # Files to test (exclude __init__.py and _private.py)
+        testable_files = [f for f in all_source_files 
+                         if f.name != "__init__.py" and not f.name.startswith("_")]
         
-        # Phase 3: Test Execution with Mutation Testing (on fixed tests)
-        if run_execution:
-            if verbose:
-                print("\n[3/3] Test Execution (Mutation Testing)...")
-            try:
-                if generated_test_dir.exists():
-                    if language == "python":
-                        result["execution"] = self.execution_measurer.measure_python(
-                            bot_name=bot.name,
-                            project_path=project_path,
-                            test_path=str(generated_test_dir),
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    elif language == "java":
-                        result["execution"] = self.execution_measurer.measure_java(
-                            bot_name=bot.name,
-                            project_path=project_path,
-                            test_path=str(generated_test_dir),
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    elif language == "javascript":
-                        result["execution"] = self.execution_measurer.measure_javascript(
-                            bot_name=bot.name,
-                            project_path=project_path,
-                            test_path=str(generated_test_dir),
-                            project_name=project_name,
-                            debug=debug
-                        )
-                    
-                    if verbose and result["execution"]:
-                        e = result["execution"]
-                        print(f"    Tests: {e.tests_passed} passed, {e.tests_failed} failed")
-                        if e.total_mutants > 0:
-                            print(f"    Mutants: {e.mutants_killed}/{e.total_mutants} killed ({e.mutation_score:.1f}%)")
-                        else:
-                            print(f"    Mutants: Skipped (no passing tests)")
-                else:
-                    if verbose:
-                        print("    Skipped (no generated tests)")
-            except Exception as e:
-                print(f"    Error: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
-        
-        # Display results
         if verbose:
-            print(f"\n{'─'*40}")
-            print("RESULTS:")
-            if result["creation"]:
-                print(f"  Test Coverage:      {result['creation'].line_coverage:.1f}%")
-            if result["execution"]:
-                e = result["execution"]
-                print(f"  Mutation Score:     {e.mutation_score:.1f}% ({e.mutants_killed}/{e.total_mutants} killed)")
-                print(f"  Surviving Mutants:  {e.mutants_survived} (false negatives)")
-            if result["maintenance"]:
-                m = result["maintenance"]
-                print(f"  Errors Fixed:       {m.get_fix_percentage_display()}")
-                if m.successful_repairs > 0:
-                    eff = m.get_efficiency_score()
-                    if eff is not None:
-                        print(f"  Fix Efficiency:     {eff:.1f}% (first-attempt)")
+            print(f"\n    Found {len(testable_files)} testable file(s)")
         
-        # Add to report generator
-        self.report_generator.add_result(
-            bot_name=result["bot_name"],
-            language=result["language"],
-            project_name=result["project_name"],
-            creation=result["creation"],
-            execution=result["execution"],
-            maintenance=result["maintenance"]
+        # Create work directory
+        test_dir = self.work_dir / "generated_tests"
+        if test_dir.exists():
+            shutil.rmtree(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy ALL source files (with relative imports fixed)
+        if debug:
+            print(f"    [DEBUG] Copying source files to {test_dir}")
+        for src_file in all_source_files:
+            content = src_file.read_text(encoding='utf-8', errors='replace')
+            
+            # Fix relative imports ONLY (starting with .)
+            # from .module import x -> from module import x
+            content = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', content)
+            # from . import module -> import module
+            content = re.sub(r'from\s+\.\s+import\s+(\w+)', r'import \1', content)
+            # from ..module import x -> from module import x
+            content = re.sub(r'from\s+\.\.(\w+)\s+import', r'from \1 import', content)
+            # from .. import module -> import module
+            content = re.sub(r'from\s+\.\.\s+import\s+(\w+)', r'import \1', content)
+            # from .package.module import -> from package.module import  
+            content = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', content)
+            # from ...module import (3 dots) -> from module import
+            content = re.sub(r'from\s+\.\.\.+(\w+)\s+import', r'from \1 import', content)
+            
+            dest_file = test_dir / src_file.name
+            dest_file.write_text(content, encoding='utf-8')
+            if debug:
+                print(f"    [DEBUG]   Copied: {src_file.name}")
+        
+        if debug:
+            print(f"    [DEBUG] Files in test_dir: {[f.name for f in test_dir.glob('*.py')]}")
+        
+        # Create __init__.py to make test_dir a package (helps with imports)
+        init_file = test_dir / "__init__.py"
+        init_file.write_text("", encoding='utf-8')
+        
+        # Create conftest.py to add test_dir to path
+        conftest_file = test_dir / "conftest.py"
+        conftest_content = '''import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+'''
+        conftest_file.write_text(conftest_content, encoding='utf-8')
+        
+        # Build dependency map for context
+        module_contents = {}
+        for sf in all_source_files:
+            module_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
+        # Process each file
+        results = []
+        for idx, source_file in enumerate(testable_files):
+            if verbose:
+                print(f"\n    [{idx + 1}/{len(testable_files)}] {source_file.name}")
+            
+            result = self._process_python_file(
+                bot=bot,
+                source_file=source_file,
+                test_dir=test_dir,
+                project_name=project_name,
+                module_contents=module_contents,
+                all_source_files=all_source_files,
+                verbose=verbose,
+                debug=debug
+            )
+            results.append(result)
+            self.results.append(result)
+        
+        # Print summary
+        if verbose:
+            self._print_project_summary(results)
+        
+        return results
+    
+    def _process_python_file(
+        self,
+        bot: BotInterface,
+        source_file: Path,
+        test_dir: Path,
+        project_name: str,
+        module_contents: dict,
+        all_source_files: list,
+        verbose: bool,
+        debug: bool
+    ) -> FileResult:
+        """Process a single Python file through the complete pipeline."""
+        
+        result = FileResult(
+            bot_name=bot.name,
+            language="python",
+            project_name=project_name,
+            file_name=source_file.name
         )
+        
+        source_code = source_file.read_text(encoding='utf-8', errors='replace')
+        module_name = source_file.stem
+        test_filename = f"test_{module_name}.py"
+        test_path = test_dir / test_filename
+        
+        # ========== STEP 1: Generate Test ==========
+        if verbose:
+            print(f"        [1/3] Test Creation...")
+        start_time = time.time()
+        
+        # Build context with dependencies
+        code_with_context = self._build_python_context(
+            source_code, module_name, module_contents, all_source_files, source_file
+        )
+        
+        try:
+            generated_test = bot.generate_tests(
+                code_with_context, 
+                module_name=module_name, 
+                language="python"
+            )
+            if generated_test:
+                test_path.write_text(generated_test, encoding='utf-8')
+                result.test_generated = True
+                if verbose:
+                    print(f"              ✓ Test generated")
+            else:
+                if verbose:
+                    print(f"              ✗ No test generated")
+                return result
+        except Exception as e:
+            if verbose:
+                print(f"              ✗ Generation error: {e}")
+            return result
+        
+        result.generation_time_seconds = time.time() - start_time
+        
+        # ========== STEP 2: Run Coverage ==========
+        coverage, passed, failed, error_msg = self._run_python_coverage(
+            test_path, module_name, test_dir, debug
+        )
+        
+        result.tests_passed = passed
+        result.tests_failed = failed
+        
+        # ========== STEP 3: If Error, Fix (Maintenance) ==========
+        if error_msg:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+            result.had_errors = True
+            result.errors_remain = True
+            if verbose:
+                print(f"              ✗ Tests have errors, attempting fix...")
+            
+            for attempt in range(3):
+                result.fix_attempts += 1
+                try:
+                    current_test = test_path.read_text(encoding='utf-8', errors='replace')
+                    fixed_test = bot.repair_test(
+                        current_test, error_msg, "test_error"
+                    )
+                    
+                    if fixed_test:
+                        test_path.write_text(fixed_test, encoding='utf-8')
+                        
+                        # Re-run coverage
+                        coverage, passed, failed, error_msg = self._run_python_coverage(
+                            test_path, module_name, test_dir, debug
+                        )
+                        
+                        result.tests_passed = passed
+                        result.tests_failed = failed
+                        
+                        if not error_msg:
+                            result.errors_fixed = True
+                            result.errors_remain = False
+                            if attempt == 0:
+                                result.first_attempt_fix = True
+                            if verbose:
+                                print(f"              ✓ Fixed on attempt {attempt + 1}")
+                            break
+                except Exception as e:
+                    if debug:
+                        print(f"              [DEBUG] Fix attempt {attempt + 1} failed: {e}")
+            
+            if result.errors_remain and verbose:
+                print(f"              ✗ Could not fix after {result.fix_attempts} attempts")
+        else:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+                print(f"              No errors to fix")
+        
+        # Record coverage
+        if coverage is not None:
+            result.line_coverage_pct = coverage
+            if verbose:
+                print(f"              Coverage: {coverage:.1f}%")
+        
+        # ========== STEP 4: If No Error, Run Mutation Testing (Execution) ==========
+        if verbose:
+            print(f"        [3/3] Test Execution (Mutation Testing)...")
+        
+        if not result.errors_remain and result.tests_passed > 0:
+            mutation_results = self._run_python_mutation(
+                source_file, test_path, test_dir, module_name, debug
+            )
+            
+            result.mutants_total = mutation_results.get("total", 0)
+            result.mutants_killed = mutation_results.get("killed", 0)
+            result.mutants_survived = mutation_results.get("survived", 0)
+            
+            if result.mutants_total > 0:
+                result.mutation_score_pct = (result.mutants_killed / result.mutants_total) * 100
+                if verbose:
+                    print(f"              Mutants: {result.mutants_killed}/{result.mutants_total} killed ({result.mutation_score_pct:.1f}%)")
+            else:
+                if verbose:
+                    print(f"              No mutants generated")
+        else:
+            if verbose:
+                if result.errors_remain:
+                    print(f"              Skipped (errors remain)")
+                else:
+                    print(f"              Skipped (no passing tests)")
         
         return result
     
-    def _reanalyze_coverage(
-        self,
-        language: str,
-        test_dir: Path,
-        source_dir: str,
-        debug: bool = False
-    ) -> float:
-        """Re-analyze coverage after maintenance fixes."""
-        import subprocess
-        import re
-        import platform
-        import shutil
+    def _build_python_context(
+        self, 
+        source_code: str, 
+        module_name: str, 
+        module_contents: dict, 
+        all_source_files: list,
+        source_file: Path
+    ) -> str:
+        """Build source code with dependency context."""
+        imports = []
+        for match in re.finditer(r'(?:from\s+(\w+)\s+import|^import\s+(\w+))', source_code, re.MULTILINE):
+            module = match.group(1) or match.group(2)
+            if module:
+                imports.append(module)
+        
+        dependency_code = ""
+        for imp in imports:
+            if imp in module_contents and imp != module_name:
+                dep_content = module_contents[imp]
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n# ... (truncated)"
+                dependency_code += f"\n\n# === DEPENDENCY: {imp}.py ===\n{dep_content}"
+        
+        if dependency_code:
+            return source_code + "\n\n# === PROJECT DEPENDENCIES ===" + dependency_code
+        elif len(all_source_files) > 1:
+            other_files = [sf.name for sf in all_source_files if sf != source_file]
+            if other_files:
+                return source_code + f"\n\n# NOTE: Project also contains: {', '.join(other_files)}"
+        
+        return source_code
+    
+    def _run_python_coverage(
+        self, 
+        test_path: Path, 
+        module_name: str, 
+        test_dir: Path, 
+        debug: bool
+    ) -> tuple:
+        """
+        Run pytest with coverage.
+        Returns: (coverage_pct, tests_passed, tests_failed, error_message)
+        """
+        # Fix imports in test file
+        test_content = test_path.read_text(encoding='utf-8', errors='replace')
+        original_content = test_content
+        
+        # Fix import patterns that LLMs generate for LOCAL project imports
+        # Only fix 'src.' prefix which is a common LLM pattern
+        test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
+        
+        # Add sys.path fix at the top of the test file if not already present
+        if "sys.path" not in test_content:
+            path_fix = "import sys\nimport os\nsys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n\n"
+            test_content = path_fix + test_content
+        
+        if test_content != original_content:
+            test_path.write_text(test_content, encoding='utf-8')
+            if debug:
+                print(f"              [DEBUG] Fixed imports in test file")
+        
+        # Verify source file exists in test_dir
+        source_file = test_dir / f"{module_name}.py"
+        if not source_file.exists():
+            if debug:
+                print(f"              [DEBUG] WARNING: Source file {module_name}.py not found in {test_dir}")
+                print(f"              [DEBUG] Available files: {[f.name for f in test_dir.glob('*.py')]}")
+        
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(test_dir)
+        
+        # Clean old coverage
+        coverage_json = test_dir / "coverage.json"
+        if coverage_json.exists():
+            coverage_json.unlink()
+        
+        cmd = [
+            "python", "-m", "pytest",
+            test_path.name,
+            f"--cov={module_name}",
+            "--cov-report=json:coverage.json",
+            "--cov-report=term",
+            "-v", "--tb=long"
+        ]
         
         try:
-            if language == "python":
-                # Run pytest with coverage
-                result = subprocess.run(
-                    ["python", "-m", "pytest", "--cov=.", "--cov-report=term-missing", "-q"],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(test_dir),
-                    timeout=120,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                output = (result.stdout or "") + (result.stderr or "")
-                
-                # Parse coverage: TOTAL ... XX%
-                cov_match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", output)
-                coverage_value = float(cov_match.group(1)) if cov_match else None
-                
-                # Cleanup coverage files
-                coverage_file = test_dir / ".coverage"
-                if coverage_file.exists():
-                    coverage_file.unlink()
-                htmlcov_dir = test_dir / "htmlcov"
-                if htmlcov_dir.exists():
-                    shutil.rmtree(htmlcov_dir, ignore_errors=True)
-                
-                return coverage_value
-                    
-            elif language == "java":
-                # Run Maven test (JaCoCo will update coverage)
-                is_windows = platform.system() == "Windows"
-                mvn_cmd = "mvn.cmd" if is_windows else "mvn"
-                
-                result = subprocess.run(
-                    [mvn_cmd, "test", "-q"],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(test_dir),
-                    timeout=300,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                
-                coverage_value = None
-                
-                # Parse JaCoCo CSV report
-                coverage_csv = test_dir / "target" / "site" / "jacoco" / "jacoco.csv"
-                if coverage_csv.exists():
-                    coverage_data = coverage_csv.read_text(encoding='utf-8')
-                    lines = coverage_data.strip().split('\n')
-                    if len(lines) > 1:
-                        total_covered = 0
-                        total_missed = 0
-                        for line in lines[1:]:
-                            parts = line.split(',')
-                            if len(parts) >= 9:
-                                try:
-                                    missed = int(parts[7])
-                                    covered = int(parts[8])
-                                    total_missed += missed
-                                    total_covered += covered
-                                except (ValueError, IndexError):
-                                    pass
-                        
-                        total = total_covered + total_missed
-                        if total > 0:
-                            coverage_value = (total_covered / total) * 100
-                    
-                    # Cleanup JaCoCo files
-                    coverage_csv.unlink()
-                
-                # Also cleanup jacoco.exec
-                jacoco_exec = test_dir / "target" / "jacoco.exec"
-                if jacoco_exec.exists():
-                    jacoco_exec.unlink()
-                
-                return coverage_value
-                            
-            elif language == "javascript":
-                # Run Jest with coverage
-                is_windows = platform.system() == "Windows"
-                npx_cmd = "npx.cmd" if is_windows else "npx"
-                
-                result = subprocess.run(
-                    [npx_cmd, "jest", "--coverage", "--coverageReporters=json-summary", "-silent"],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(test_dir),
-                    timeout=120,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                
-                coverage_value = None
-                
-                # Parse coverage-summary.json
-                import json
-                coverage_file = test_dir / "coverage" / "coverage-summary.json"
-                if coverage_file.exists():
-                    data = json.loads(coverage_file.read_text(encoding='utf-8'))
-                    lines = data.get("total", {}).get("lines", {})
-                    pct = lines.get("pct", 0)
-                    if isinstance(pct, (int, float)):
-                        coverage_value = float(pct)
-                
-                # Cleanup coverage directory
-                coverage_dir = test_dir / "coverage"
-                if coverage_dir.exists():
-                    shutil.rmtree(coverage_dir, ignore_errors=True)
-                
-                return coverage_value
-                        
-        except Exception as e:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                env=env,
+                timeout=120
+            )
+            
+            output = result.stdout + result.stderr
+            
             if debug:
-                print(f"    [DEBUG] Coverage re-analysis error: {e}")
+                print(f"        [DEBUG] pytest return code: {result.returncode}")
+                if result.returncode != 0:
+                    print(f"        [DEBUG] Output (last 300): {output[-300:]}")
+            
+            # Parse test counts
+            passed = 0
+            failed = 0
+            passed_match = re.search(r'(\d+) passed', output)
+            failed_match = re.search(r'(\d+) failed', output)
+            error_match = re.search(r'(\d+) error', output)
+            
+            if passed_match:
+                passed = int(passed_match.group(1))
+            if failed_match:
+                failed = int(failed_match.group(1))
+            if error_match:
+                failed += int(error_match.group(1))
+            
+            # Check for errors (collection errors, import errors, etc.)
+            error_msg = None
+            if result.returncode != 0:
+                # Check for actual errors vs just test failures
+                if "Error" in output or "error" in output:
+                    if "FAILED" not in output or passed == 0:
+                        # Try to find the actual error line
+                        # Look for ModuleNotFoundError or No module named
+                        module_error = re.search(
+                            r'(ModuleNotFoundError|No module named)[^\n]+',
+                            output
+                        )
+                        if module_error:
+                            error_msg = module_error.group(0)
+                        else:
+                            # Look for any Error line
+                            error_pattern = re.search(
+                                r'E\s+((?:Syntax|Import|Name|Type|Attribute|Module|ModuleNotFound)Error[^\n]+)', 
+                                output
+                            )
+                            if error_pattern:
+                                error_msg = error_pattern.group(1)
+                            else:
+                                # Fall back to last 500 chars
+                                error_msg = output[-500:]
+                        
+                        if debug:
+                            print(f"              [DEBUG] Full output (last 800): {output[-800:]}")
+            
+            # Parse coverage
+            coverage_pct = None
+            
+            # Try JSON
+            if coverage_json.exists():
+                try:
+                    with open(coverage_json, encoding='utf-8') as f:
+                        cov_data = json.load(f)
+                        totals = cov_data.get("totals", {})
+                        coverage_pct = totals.get("percent_covered", 0.0)
+                    coverage_json.unlink()
+                except:
+                    pass
+            
+            # Fallback to terminal
+            if coverage_pct is None:
+                cov_match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', output)
+                if cov_match:
+                    coverage_pct = float(cov_match.group(1))
+            
+            # Cleanup
+            dotcoverage = test_dir / ".coverage"
+            if dotcoverage.exists():
+                dotcoverage.unlink()
+            
+            return coverage_pct or 0.0, passed, failed, error_msg
+            
+        except subprocess.TimeoutExpired:
+            return 0.0, 0, 0, "Timeout"
+        except Exception as e:
+            return 0.0, 0, 0, str(e)
+    
+    def _run_python_mutation(
+        self, 
+        source_file: Path, 
+        test_path: Path,
+        test_dir: Path, 
+        module_name: str, 
+        debug: bool
+    ) -> dict:
+        """Run mutation testing on a single file."""
+        results = {"total": 0, "killed": 0, "survived": 0}
         
-        return None
+        source_in_test_dir = test_dir / source_file.name
+        if not source_in_test_dir.exists():
+            return results
+        
+        original_code = source_in_test_dir.read_text(encoding='utf-8', errors='replace')
+        
+        # Generate mutants
+        mutants = self._generate_python_mutants(original_code)
+        
+        if debug:
+            print(f"        [DEBUG] Generated {len(mutants)} mutants")
+        
+        # Test each mutant (limit to 20)
+        for mutant_code in mutants[:20]:
+            killed = self._test_python_mutant(
+                source_in_test_dir, mutant_code, original_code,
+                test_path, test_dir
+            )
+            if killed:
+                results["killed"] += 1
+            else:
+                results["survived"] += 1
+        
+        results["total"] = min(len(mutants), 20)
+        
+        return results
+    
+    def _generate_python_mutants(self, code: str) -> list:
+        """Generate mutants for Python code."""
+        mutants = []
+        
+        mutations = [
+            (r'==', '!='), (r'!=', '=='),
+            (r'<=', '>'), (r'>=', '<'),
+            (r'<(?!=)', '>='), (r'>(?!=)', '<='),
+            (r'\+(?!=)', '-'), (r'-(?!=)', '+'),
+            (r'\*(?!=)', '/'), (r'/(?!=)', '*'),
+            (r'\band\b', 'or'), (r'\bor\b', 'and'),
+            (r'\bTrue\b', 'False'), (r'\bFalse\b', 'True'),
+            (r'\bnot\s+', ''),
+            (r'is\s+None', 'is not None'),
+            (r'is\s+not\s+None', 'is None'),
+        ]
+        
+        for pattern, replacement in mutations:
+            for match in re.finditer(pattern, code):
+                mutant = code[:match.start()] + replacement + code[match.end():]
+                if mutant != code:
+                    mutants.append(mutant)
+        
+        return mutants
+    
+    def _test_python_mutant(
+        self, 
+        source_path: Path, 
+        mutant_code: str, 
+        original_code: str, 
+        test_path: Path, 
+        test_dir: Path
+    ) -> bool:
+        """Test if a mutant is killed. Returns True if killed."""
+        # Apply mutant
+        source_path.write_text(mutant_code, encoding='utf-8')
+        
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(test_dir)
+        
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", test_path.name, "-x", "--tb=no", "-q"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                env=env,
+                timeout=30
+            )
+            killed = result.returncode != 0
+        except:
+            killed = True
+        finally:
+            # Restore original
+            source_path.write_text(original_code, encoding='utf-8')
+        
+        return killed
+    
+    def _run_java_benchmark(
+        self,
+        bot: BotInterface,
+        project_path: Path,
+        project_name: str,
+        verbose: bool,
+        debug: bool
+    ) -> List[FileResult]:
+        """Run per-file benchmark for Java (placeholder)."""
+        if verbose:
+            print("    Java per-file benchmark not yet implemented")
+        return []
+    
+    def _run_javascript_benchmark(
+        self,
+        bot: BotInterface,
+        project_path: Path,
+        project_name: str,
+        verbose: bool,
+        debug: bool
+    ) -> List[FileResult]:
+        """Run per-file benchmark for JavaScript (placeholder)."""
+        if verbose:
+            print("    JavaScript per-file benchmark not yet implemented")
+        return []
+    
+    def _print_project_summary(self, results: List[FileResult]):
+        """Print summary for a project."""
+        if not results:
+            return
+        
+        print(f"\n{'─'*40}")
+        print("PROJECT SUMMARY:")
+        
+        total_coverage = sum(r.line_coverage_pct for r in results) / len(results) if results else 0
+        total_mutation = sum(r.mutation_score_pct for r in results) / len(results) if results else 0
+        files_with_errors = sum(1 for r in results if r.had_errors)
+        files_fixed = sum(1 for r in results if r.errors_fixed)
+        files_with_remaining_errors = sum(1 for r in results if r.errors_remain)
+        
+        print(f"  Files tested:       {len(results)}")
+        print(f"  Avg Coverage:       {total_coverage:.1f}%")
+        print(f"  Avg Mutation Score: {total_mutation:.1f}%")
+        print(f"  Files with errors:  {files_with_errors}")
+        print(f"  Files fixed:        {files_fixed}")
+        print(f"  Errors remaining:   {files_with_remaining_errors}")
     
     def run_all_bots(
         self,
@@ -424,25 +704,13 @@ class BenchmarkRunner:
         project_name: str = None,
         verbose: bool = True,
         debug: bool = False
-    ) -> list:
+    ) -> List[FileResult]:
         """Run benchmark on all available bots."""
-        available = get_available_bots()
-        
-        if not available:
-            print("No bots available. Set API keys:")
-            print("  export OPENAI_API_KEY='...'")
-            print("  export ANTHROPIC_API_KEY='...'")
-            print("  export GOOGLE_API_KEY='...'")
-            return []
-        
-        if verbose:
-            print(f"\nAvailable bots: {[name for _, name in available]}")
-        
-        results = []
-        for bot_id, bot_name in available:
+        all_results = []
+        for bot_id, display_name in get_available_bots():
             try:
                 bot = create_bot(bot_id, debug=debug)
-                result = self.run_benchmark(
+                results = self.run_benchmark(
                     bot=bot,
                     project_path=project_path,
                     language=language,
@@ -450,32 +718,97 @@ class BenchmarkRunner:
                     verbose=verbose,
                     debug=debug
                 )
-                results.append(result)
+                all_results.extend(results)
             except Exception as e:
-                print(f"Error with {bot_name}: {e}")
-        
-        return results
+                print(f"Error with {display_name}: {e}")
+        return all_results
     
     def save_results(self) -> dict:
         """Save all results to CSV files."""
-        return self.report_generator.generate_all_csvs()
+        import csv
+        
+        files = {}
+        
+        # benchmark_summary.csv - one row per file
+        summary_path = self.output_dir / "benchmark_summary.csv"
+        with open(summary_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "bot_name", "language", "project", "file_name", "timestamp",
+                "line_coverage_pct", "tests_passed", "tests_failed",
+                "mutation_score_pct", "mutants_killed", "mutants_survived",
+                "errors_fixed_pct", "errors_remain"
+            ])
+            for r in self.results:
+                errors_fixed_pct = 100.0 if r.errors_fixed else (0.0 if r.had_errors else "N/A")
+                writer.writerow([
+                    r.bot_name, r.language, r.project_name, r.file_name, r.timestamp,
+                    round(r.line_coverage_pct, 2), r.tests_passed, r.tests_failed,
+                    round(r.mutation_score_pct, 2), r.mutants_killed, r.mutants_survived,
+                    errors_fixed_pct, r.errors_remain
+                ])
+        files["summary"] = str(summary_path)
+        
+        # creation_metrics.csv
+        creation_path = self.output_dir / "creation_metrics.csv"
+        with open(creation_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "bot_name", "language", "project", "file_name",
+                "test_generated", "generation_time_sec",
+                "line_coverage_pct", "tests_passed", "tests_failed"
+            ])
+            for r in self.results:
+                writer.writerow([
+                    r.bot_name, r.language, r.project_name, r.file_name,
+                    r.test_generated, round(r.generation_time_seconds, 2),
+                    round(r.line_coverage_pct, 2), r.tests_passed, r.tests_failed
+                ])
+        files["creation"] = str(creation_path)
+        
+        # execution_metrics.csv
+        execution_path = self.output_dir / "execution_metrics.csv"
+        with open(execution_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "bot_name", "language", "project", "file_name",
+                "tests_passed", "tests_failed",
+                "mutants_total", "mutants_killed", "mutants_survived", "mutation_score_pct"
+            ])
+            for r in self.results:
+                writer.writerow([
+                    r.bot_name, r.language, r.project_name, r.file_name,
+                    r.tests_passed, r.tests_failed,
+                    r.mutants_total, r.mutants_killed, r.mutants_survived,
+                    round(r.mutation_score_pct, 2)
+                ])
+        files["execution"] = str(execution_path)
+        
+        # maintenance_metrics.csv
+        maintenance_path = self.output_dir / "maintenance_metrics.csv"
+        with open(maintenance_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "bot_name", "language", "project", "file_name",
+                "had_errors", "errors_fixed", "errors_remain",
+                "fix_attempts", "first_attempt_fix"
+            ])
+            for r in self.results:
+                writer.writerow([
+                    r.bot_name, r.language, r.project_name, r.file_name,
+                    r.had_errors, r.errors_fixed, r.errors_remain,
+                    r.fix_attempts, r.first_attempt_fix
+                ])
+        files["maintenance"] = str(maintenance_path)
+        
+        return files
 
 
-def discover_projects(language: str, base_dir: Path = None) -> list[Path]:
-    """
-    Discover all projects for a given language.
-    
-    Projects are expected to be in:
-    - ./python/<project_name>/src for Python
-    - ./java/<project_name>/src for Java  
-    - ./js/<project_name>/src for JavaScript
-    
-    Returns list of paths to project source directories.
-    """
+def discover_projects(language: str, base_dir: Path = None) -> list:
+    """Discover all projects for a given language."""
     if base_dir is None:
         base_dir = Path(".")
     
-    # Map language to directory name
     lang_dirs = {
         "python": "python",
         "java": "java",
@@ -489,19 +822,14 @@ def discover_projects(language: str, base_dir: Path = None) -> list[Path]:
     
     projects = []
     
-    # Look for project directories
     for item in lang_dir.iterdir():
         if item.is_dir() and not item.name.startswith('.'):
-            # Check for src subdirectory first
             src_dir = item / "src"
             if src_dir.exists() and src_dir.is_dir():
                 projects.append(src_dir)
-            # Also check for lib subdirectory
             elif (item / "lib").exists():
                 projects.append(item / "lib")
-            # Otherwise use the project directory itself if it has source files
             else:
-                # Check if directory has source files
                 extensions = {
                     "python": "*.py",
                     "java": "*.java",
@@ -520,16 +848,15 @@ def main():
                         help="Bot to benchmark (or 'all' to run all bots)")
     parser.add_argument("--language", type=str, required=True,
                         choices=["python", "java", "javascript", "all"], 
-                        help="Programming language (or 'all' to run all languages)")
+                        help="Programming language")
     parser.add_argument("--project", type=str, default=None,
-                        help="Path to source code (if not specified, runs all projects in ./<language>/ folder)")
+                        help="Path to source code")
     parser.add_argument("--output", type=str, default="./benchmark_results", help="Output directory")
     parser.add_argument("--quiet", action="store_true", help="Reduce output")
-    parser.add_argument("--debug", action="store_true", help="Enable debug output for API calls")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
     
     args = parser.parse_args()
     
-    # Handle --bot all - set a flag for running all bots
     run_all_bots = False
     if args.bot and args.bot.lower() == "all":
         run_all_bots = True
@@ -541,29 +868,18 @@ def main():
     if not args.bot and not run_all_bots:
         parser.error("Specify --bot <bot_name> or --bot all")
     
-    # Determine which languages to run
     if args.language.lower() == "all":
         languages = ["python", "java", "javascript"]
     else:
         languages = [args.language]
     
-    # Create runner
-    try:
-        runner = BenchmarkRunner(output_dir=args.output)
-    except Exception as e:
-        print(f"Error creating BenchmarkRunner: {e}")
-        if args.debug:
-            import traceback
-            traceback.print_exc()
-        return
+    runner = BenchmarkRunner(output_dir=args.output)
     
-    # Run benchmarks for each language
     for language in languages:
         print(f"\n{'#'*60}")
         print(f"# LANGUAGE: {language.upper()}")
         print(f"{'#'*60}")
         
-        # Discover projects for this language
         if args.project:
             project_paths = [Path(args.project)]
             if not project_paths[0].exists():
@@ -577,59 +893,38 @@ def main():
             print(f"\nDiscovered {len(project_paths)} project(s):")
             for p in project_paths:
                 print(f"  - {p}")
-            print()
         
-        # Run benchmarks for each project
         for project_path in project_paths:
             if args.debug:
                 print(f"\n[DEBUG] Processing project: {project_path}")
-                print(f"[DEBUG] Files in project:")
-                for f in project_path.iterdir():
-                    print(f"[DEBUG]   {f.name}")
             
             if run_all_bots:
-                try:
-                    runner.run_all_bots(
-                        project_path=str(project_path),
-                        language=language,
-                        verbose=not args.quiet,
-                        debug=args.debug
-                    )
-                except Exception as e:
-                    print(f"Error running all bots on {project_path}: {e}")
-                    if args.debug:
-                        import traceback
-                        traceback.print_exc()
+                runner.run_all_bots(
+                    project_path=str(project_path),
+                    language=language,
+                    verbose=not args.quiet,
+                    debug=args.debug
+                )
             else:
-                try:
-                    bot = create_bot(args.bot, debug=args.debug)
-                    runner.run_benchmark(
-                        bot=bot,
-                        project_path=str(project_path),
-                        language=language,
-                        verbose=not args.quiet,
-                        debug=args.debug
-                    )
-                except Exception as e:
-                    print(f"Error running {args.bot} on {project_path}: {e}")
-                    if args.debug:
-                        import traceback
-                        traceback.print_exc()
+                bot = create_bot(args.bot, debug=args.debug)
+                runner.run_benchmark(
+                    bot=bot,
+                    project_path=str(project_path),
+                    language=language,
+                    verbose=not args.quiet,
+                    debug=args.debug
+                )
     
-    # Save CSV results
-    if args.debug:
-        print("[DEBUG] Saving results...")
-    try:
+    # Save results
+    if runner.results:
         csv_files = runner.save_results()
         print(f"\n{'='*60}")
         print("CSV FILES GENERATED:")
         for name, path in csv_files.items():
             print(f"  {name}: {path}")
         print(f"{'='*60}")
-    except Exception as e:
-        print(f"[DEBUG] Error saving results: {e}")
-        import traceback
-        traceback.print_exc()
+    else:
+        print("\nNo results to save.")
 
 
 if __name__ == "__main__":

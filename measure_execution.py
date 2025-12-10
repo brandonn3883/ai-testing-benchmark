@@ -113,7 +113,7 @@ class TestExecutionMeasurer:
         project_path: str,
         test_path: str,
         project_name: str = "unnamed",
-        max_mutants: int = 20,
+        max_mutants: int = 200,
         debug: bool = False
     ) -> ExecutionMeasurement:
         """
@@ -304,16 +304,25 @@ class TestExecutionMeasurer:
             # Fix imports - replace "from src.X import" with "from X import"
             # This handles cases like "from src.slugify import ..." -> "from slugify import ..."
             test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
+            # Also fix package.submodule imports
+            test_content = re.sub(r'from\s+(\w+)\.errors\s+import', r'from errors import', test_content)
+            test_content = re.sub(r'from\s+(\w+)\._regex\s+import', r'from _regex import', test_content)
             (mutation_dir / test_file.name).write_text(test_content, encoding='utf-8')
         
-        # Copy other source files (non-mutated)
+        # Copy other source files (non-mutated) - fix relative imports
         for src_file in source_file.parent.glob("*.py"):
             if src_file.name != source_file.name and not src_file.name.startswith("test_"):
-                shutil.copy(src_file, mutation_dir / src_file.name)
+                content = src_file.read_text(encoding='utf-8', errors='replace')
+                # Fix relative imports
+                content = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', content)
+                content = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', content)
+                (mutation_dir / src_file.name).write_text(content, encoding='utf-8')
         
-        # Write mutated source file
+        # Write mutated source file (also fix relative imports in the mutant)
+        mutant_code_fixed = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', mutant_code)
+        mutant_code_fixed = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', mutant_code_fixed)
         mutant_file = mutation_dir / source_file.name
-        mutant_file.write_text(mutant_code, encoding='utf-8')
+        mutant_file.write_text(mutant_code_fixed, encoding='utf-8')
         
         # Run tests
         env = os.environ.copy()
@@ -350,17 +359,25 @@ class TestExecutionMeasurer:
             "duration": 0.0
         }
         
-        # Copy source files to test directory
+        # Copy source files to test directory - fix relative imports
         for src_file in project_path.glob("*.py"):
             if not src_file.name.startswith("test_"):
-                shutil.copy(src_file, test_path / src_file.name)
+                content = src_file.read_text(encoding='utf-8', errors='replace')
+                # Fix relative imports
+                content = re.sub(r'from\s+\.(\w+)\s+import', r'from \1 import', content)
+                content = re.sub(r'from\s+\.(\w+\.\w+)\s+import', r'from \1 import', content)
+                (test_path / src_file.name).write_text(content, encoding='utf-8')
         
         # Fix imports in test files - replace "from src.X import" with "from X import"
         for test_file in test_path.glob("test_*.py"):
             test_content = test_file.read_text(encoding='utf-8', errors='replace')
-            fixed_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
-            if fixed_content != test_content:
-                test_file.write_text(fixed_content, encoding='utf-8')
+            original = test_content
+            test_content = re.sub(r'from\s+src\.(\w+)\s+import', r'from \1 import', test_content)
+            # Also fix package.submodule imports
+            test_content = re.sub(r'from\s+(\w+)\.errors\s+import', r'from errors import', test_content)
+            test_content = re.sub(r'from\s+(\w+)\._regex\s+import', r'from _regex import', test_content)
+            if test_content != original:
+                test_file.write_text(test_content, encoding='utf-8')
         
         env = os.environ.copy()
         env["PYTHONPATH"] = str(test_path)
@@ -442,7 +459,7 @@ class TestExecutionMeasurer:
         project_path: str,
         test_path: str,
         project_name: str = "unnamed",
-        max_mutants: int = 20,
+        max_mutants: int = 200,
         debug: bool = False
     ) -> ExecutionMeasurement:
         """Measure Java test execution using PITest mutation testing."""
@@ -727,7 +744,7 @@ class TestExecutionMeasurer:
         project_path: str,
         test_path: str,
         project_name: str = "unnamed",
-        max_mutants: int = 20,
+        max_mutants: int = 200,
         debug: bool = False
     ) -> ExecutionMeasurement:
         """Measure JavaScript test execution using mutation testing."""

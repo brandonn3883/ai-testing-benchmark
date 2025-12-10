@@ -39,24 +39,25 @@ class CSVReportGenerator:
         })
     
     def generate_summary_csv(self, filename: str = "benchmark_summary.csv") -> str:
-        """Generate summary CSV with key metrics for all bots."""
+        """Generate summary CSV with key metrics for all bots, one row per source file."""
         filepath = self.output_dir / filename
         
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             
-            # Header
+            # Header - added file_name and file_coverage_pct
             writer.writerow([
-                "bot_name", "language", "project", "timestamp",
-                "test_coverage_pct", "tests_failed",
+                "bot_name", "language", "project", "file_name", "timestamp",
+                "file_coverage_pct", "project_coverage_pct", "tests_failed",
                 "mutation_score_pct", "mutants_killed", "mutants_survived", 
                 "errors_fixed_pct", "failed_repairs", "errors_remain"
             ])
             
-            # Data rows
+            # Data rows - one row per source file
             for r in self.results:
-                coverage = r["creation"].line_coverage if r["creation"] else 0
+                project_coverage = r["creation"].line_coverage if r["creation"] else 0
                 tests_failed = r["creation"].tests_failed if r["creation"] else 0
+                per_file_coverage = r["creation"].per_file_coverage if r["creation"] else {}
                 
                 if r["execution"]:
                     mutation_score = r["execution"].mutation_score
@@ -78,12 +79,23 @@ class CSVReportGenerator:
                     failed_repairs = 0
                     errors_remain = False
                 
-                writer.writerow([
-                    r["bot_name"], r["language"], r["project_name"], r["timestamp"],
-                    round(coverage, 2), tests_failed,
-                    round(mutation_score, 2), killed, survived, 
-                    fixed_pct_str, failed_repairs, errors_remain
-                ])
+                # Write one row per source file
+                if per_file_coverage:
+                    for file_name, file_cov in per_file_coverage.items():
+                        writer.writerow([
+                            r["bot_name"], r["language"], r["project_name"], file_name, r["timestamp"],
+                            round(file_cov, 2), round(project_coverage, 2), tests_failed,
+                            round(mutation_score, 2), killed, survived, 
+                            fixed_pct_str, failed_repairs, errors_remain
+                        ])
+                else:
+                    # No per-file data, write single row with empty file_name
+                    writer.writerow([
+                        r["bot_name"], r["language"], r["project_name"], "", r["timestamp"],
+                        round(project_coverage, 2), round(project_coverage, 2), tests_failed,
+                        round(mutation_score, 2), killed, survived, 
+                        fixed_pct_str, failed_repairs, errors_remain
+                    ])
         
         return str(filepath)
     
@@ -177,14 +189,65 @@ class CSVReportGenerator:
         
         return str(filepath)
     
+    def generate_per_file_coverage_csv(self, filename: str = "per_file_coverage.csv") -> str:
+        """Generate CSV for per-file coverage metrics."""
+        filepath = self.output_dir / filename
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            writer.writerow([
+                "bot_name", "language", "project", "source_file", "line_coverage_pct"
+            ])
+            
+            for r in self.results:
+                c = r["creation"]
+                if c and c.per_file_coverage:
+                    for source_file, coverage in c.per_file_coverage.items():
+                        writer.writerow([
+                            r["bot_name"], r["language"], r["project_name"],
+                            source_file, coverage
+                        ])
+        
+        return str(filepath)
+    
     def generate_all_csvs(self) -> dict:
         """Generate all CSV reports."""
         return {
             "summary": self.generate_summary_csv(),
             "creation": self.generate_creation_csv(),
             "execution": self.generate_execution_csv(),
-            "maintenance": self.generate_maintenance_csv()
+            "maintenance": self.generate_maintenance_csv(),
+            "per_file_coverage": self.generate_per_file_coverage_csv()
         }
+    
+    def print_summary(self):
+        """Print summary to console."""
+        print("\n" + "=" * 60)
+        print("BENCHMARK RESULTS")
+        print("=" * 60)
+        
+        for r in self.results:
+            coverage = r["creation"].line_coverage if r["creation"] else 0
+            
+            if r["execution"]:
+                mutation_score = r["execution"].mutation_score
+                survived = r["execution"].mutants_survived
+            else:
+                mutation_score = 0
+                survived = 0
+            
+            if r["maintenance"]:
+                fixed_display = r["maintenance"].get_fix_percentage_display()
+            else:
+                fixed_display = "N/A"
+            
+            print(f"\n{r['bot_name']} ({r['language']}):")
+            print(f"  Test Coverage:      {coverage:.1f}%")
+            print(f"  Mutation Score:     {mutation_score:.1f}%")
+            print(f"  Surviving Mutants:  {survived} (false negatives)")
+            print(f"  Errors Fixed:       {fixed_display}")
+
 
 if __name__ == "__main__":
     print("CSV Report Generator")
