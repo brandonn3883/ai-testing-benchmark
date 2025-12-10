@@ -1,7 +1,7 @@
 # AI-Powered Testing Bot Benchmarking Framework
 
-Creates a benchmark framework for AI testing bots (ChatGPT, Claude, Gemini) across three categories:
-- **Test Creation** - Generate tests from source code
+A benchmark framework for AI testing bots (ChatGPT, Claude, Gemini) across three categories:
+- **Test Creation** - Generate tests from source code and measure coverage
 - **Test Execution** - Run tests and measure false positives/negatives through mutation testing
 - **Test Maintenance** - Fix broken tests (if any)
 
@@ -41,6 +41,15 @@ python run_benchmark.py --all --language python --project ./src --output ./resul
 
 ```
 
+## Command Line Options
+| Option     | Description                                                                |
+|------------|----------------------------------------------------------------------------|
+| --bot      | Bot to use: chatgpt, claude, gemini, or all                                |
+| --language | Language: python, java, javascript, or all                                 |
+| --project  | Path to source code directory (optional - auto-discovers if not specified) |
+| --output   | Output directory (default: ./benchmark_results)                            |
+| --debug    | Enable debug output for troubleshooting                                    |
+
 ## Output
 
 The framework generates CSV files:
@@ -49,16 +58,17 @@ The framework generates CSV files:
 - `execution_metrics.csv` - Test execution details  
 - `maintenance_metrics.csv` - Test maintenance details
 
-## Files
+## Project Structure
+Projects should be organized as follows:
 
 ```
-ai-testing-benchmark/
-├── run_benchmark.py      # Main entry point
-├── llm_bots.py           # ChatGPT, Claude, Gemini implementations
-├── standard_prompts.py   # Standardized prompts (same for all bots)
-├── measure_creation.py   # Test creation measurement
-├── measure_execution.py  # Test execution measurement
-├── measure_maintenance.py # Test maintenance measurement
-├── generate_report.py    # CSV report generation
-└── benchmark_framework.py # Core data classes
+python/
+├── project1/
+│   └── src/
+│       ├── module1.py
+│       └── module2.py
+├── project2/
+│   └── src/
+│       └── code.py
 ```
+Projects are auto-discovered when --project is not specified.

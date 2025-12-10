@@ -469,7 +469,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 text=True,
                 cwd=str(test_dir),
                 env=env,
-                timeout=120
+                timeout=120,
+                encoding='utf-8',
+                errors='replace'
             )
             
             output = result.stdout + result.stderr
@@ -639,7 +641,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 text=True,
                 cwd=str(test_dir),
                 env=env,
-                timeout=30
+                timeout=30,
+                encoding='utf-8',
+                errors='replace'
             )
             killed = result.returncode != 0
         except:
@@ -671,10 +675,633 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         verbose: bool,
         debug: bool
     ) -> List[FileResult]:
-        """Run per-file benchmark for JavaScript (placeholder)."""
+        """Run per-file benchmark for JavaScript."""
+        
+        # Find all source files
+        all_source_files = list(project_path.rglob("*.js"))
+        # Exclude test files and node_modules
+        all_source_files = [f for f in all_source_files 
+                           if not f.name.endswith('.test.js') 
+                           and not f.name.endswith('.spec.js')
+                           and not f.name.startswith('test')
+                           and 'node_modules' not in str(f)
+                           and '__tests__' not in str(f)]
+        
+        # Files to test (exclude config files and index.js if it's just exports)
+        testable_files = [f for f in all_source_files 
+                         if not f.name.startswith('.')
+                         and f.name not in ('jest.config.js', 'babel.config.js', 'webpack.config.js')]
+        
         if verbose:
-            print("    JavaScript per-file benchmark not yet implemented")
-        return []
+            print(f"\n    Found {len(testable_files)} testable file(s)")
+        
+        if not testable_files:
+            if verbose:
+                print("    No JavaScript files found to test")
+            return []
+        
+        # Create work directory
+        test_dir = self.work_dir / "generated_tests"
+        if test_dir.exists():
+            shutil.rmtree(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy ALL source files
+        if debug:
+            print(f"    [DEBUG] Copying source files to {test_dir}")
+        for src_file in all_source_files:
+            content = src_file.read_text(encoding='utf-8', errors='replace')
+            # Fix relative imports to work in flat directory
+            # require('./module') -> require('./module')  (keep as-is, they'll be in same dir)
+            # require('../module') -> require('./module')
+            content = re.sub(r"require\s*\(\s*['\"]\.\.\/(\w+)['\"]\s*\)", r"require('./\1')", content)
+            content = re.sub(r"from\s+['\"]\.\.\/(\w+)['\"]", r"from './\1'", content)
+            dest_file = test_dir / src_file.name
+            dest_file.write_text(content, encoding='utf-8')
+            if debug:
+                print(f"    [DEBUG]   Copied: {src_file.name}")
+        
+        if debug:
+            print(f"    [DEBUG] Files in test_dir: {[f.name for f in test_dir.glob('*.js')]}")
+        
+        # Create package.json for Jest with ES Module support
+        package_json = {
+            "name": "benchmark-tests",
+            "version": "1.0.0",
+            "scripts": {
+                "test": "jest --coverage --coverageReporters=json-summary --coverageReporters=text"
+            },
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "@babel/core": "^7.0.0",
+                "@babel/preset-env": "^7.0.0",
+                "babel-jest": "^29.0.0"
+            }
+        }
+        (test_dir / "package.json").write_text(json.dumps(package_json, indent=2), encoding='utf-8')
+        
+        # Create jest.config.js with babel transform
+        jest_config = """module.exports = {
+  testEnvironment: 'node',
+  coverageDirectory: 'coverage',
+  collectCoverageFrom: ['*.js', '!*.test.js', '!*.spec.js', '!jest.config.js', '!babel.config.js'],
+  testMatch: ['**/*.test.js', '**/*.spec.js'],
+  verbose: true,
+  transform: {
+    '^.+\\.js$': 'babel-jest'
+  },
+  transformIgnorePatterns: []
+};
+"""
+        (test_dir / "jest.config.js").write_text(jest_config, encoding='utf-8')
+        
+        # Create babel.config.js for ES Module support
+        babel_config = """module.exports = {
+  presets: [
+    ['@babel/preset-env', { targets: { node: 'current' } }]
+  ]
+};
+"""
+        (test_dir / "babel.config.js").write_text(babel_config, encoding='utf-8')
+        
+        # Check if Node.js/npm is available
+        npm_cmd = "npm.cmd" if os.name == 'nt' else "npm"
+        npx_cmd = "npx.cmd" if os.name == 'nt' else "npx"
+        
+        try:
+            subprocess.run([npm_cmd, "--version"], capture_output=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            if verbose:
+                print("    ✗ Node.js/npm not found. Please install Node.js from https://nodejs.org/")
+                print("    Skipping JavaScript benchmark.")
+            return []
+        
+        # Install Jest and Babel if needed (check if node_modules exists)
+        node_modules = test_dir / "node_modules"
+        if not node_modules.exists():
+            if verbose:
+                print("    Installing Jest and Babel...")
+            try:
+                result = subprocess.run(
+                    [npm_cmd, "install", "--save-dev", "jest", "@babel/core", "@babel/preset-env", "babel-jest"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(test_dir),
+                    timeout=180,  # Longer timeout for more packages
+                    shell=(os.name == 'nt'),  # Use shell on Windows
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                if result.returncode != 0:
+                    if verbose:
+                        print(f"    Warning: npm install failed: {result.stderr[:200] if result.stderr else 'Unknown error'}")
+                elif verbose:
+                    print("    Jest and Babel installed successfully")
+            except subprocess.TimeoutExpired:
+                if verbose:
+                    print("    Warning: npm install timed out")
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Could not install dependencies: {e}")
+        
+        # Build module contents map for context
+        module_contents = {}
+        for sf in all_source_files:
+            module_contents[sf.stem] = sf.read_text(encoding='utf-8', errors='replace')
+        
+        # Process each file
+        results = []
+        for idx, source_file in enumerate(testable_files):
+            if verbose:
+                print(f"\n    [{idx + 1}/{len(testable_files)}] {source_file.name}")
+            
+            result = self._process_javascript_file(
+                bot=bot,
+                source_file=source_file,
+                test_dir=test_dir,
+                project_name=project_name,
+                module_contents=module_contents,
+                all_source_files=all_source_files,
+                verbose=verbose,
+                debug=debug
+            )
+            results.append(result)
+            self.results.append(result)
+        
+        # Print summary
+        if verbose:
+            self._print_project_summary(results)
+        
+        return results
+    
+    def _process_javascript_file(
+        self,
+        bot: BotInterface,
+        source_file: Path,
+        test_dir: Path,
+        project_name: str,
+        module_contents: dict,
+        all_source_files: list,
+        verbose: bool,
+        debug: bool
+    ) -> FileResult:
+        """Process a single JavaScript file through the complete pipeline."""
+        
+        result = FileResult(
+            bot_name=bot.name,
+            language="javascript",
+            project_name=project_name,
+            file_name=source_file.name
+        )
+        
+        source_code = source_file.read_text(encoding='utf-8', errors='replace')
+        module_name = source_file.stem
+        test_filename = f"{module_name}.test.js"
+        test_path = test_dir / test_filename
+        
+        # ========== STEP 1: Generate Test ==========
+        if verbose:
+            print(f"        [1/3] Test Creation...")
+        start_time = time.time()
+        
+        # Build context with dependencies
+        code_with_context = self._build_javascript_context(
+            source_code, module_name, module_contents, all_source_files, source_file
+        )
+        
+        try:
+            generated_test = bot.generate_tests(
+                code_with_context, 
+                module_name=module_name, 
+                language="javascript"
+            )
+            if generated_test:
+                # Check if source uses ES Modules
+                source_in_dir = test_dir / source_file.name
+                source_content = source_in_dir.read_text(encoding='utf-8', errors='replace') if source_in_dir.exists() else source_code
+                uses_es_modules = 'export ' in source_content or 'export default' in source_content
+                
+                # Fix imports in generated test
+                if uses_es_modules:
+                    # Convert require to import if source uses ES modules
+                    generated_test = re.sub(
+                        rf"const\s+(\w+)\s*=\s*require\s*\(\s*['\"]\.?\/?{module_name}['\"]\s*\)",
+                        f"import {module_name} from './{module_name}'",
+                        generated_test
+                    )
+                    # Add import if not present
+                    if f"from './{module_name}'" not in generated_test and f'from "./{module_name}"' not in generated_test:
+                        if "import " not in generated_test or module_name not in generated_test:
+                            generated_test = f"import {module_name} from './{module_name}';\n\n" + generated_test
+                else:
+                    # Ensure require statement for CommonJS
+                    if f"require('./{module_name}')" not in generated_test and f"from './{module_name}'" not in generated_test:
+                        if "require(" not in generated_test and "import " not in generated_test:
+                            generated_test = f"const {module_name} = require('./{module_name}');\n\n" + generated_test
+                
+                test_path.write_text(generated_test, encoding='utf-8')
+                result.test_generated = True
+                if verbose:
+                    print(f"              ✓ Test generated")
+            else:
+                if verbose:
+                    print(f"              ✗ No test generated")
+                return result
+        except Exception as e:
+            if verbose:
+                print(f"              ✗ Generation error: {e}")
+            return result
+        
+        result.generation_time_seconds = time.time() - start_time
+        
+        # ========== STEP 2: Run Coverage ==========
+        coverage, passed, failed, error_msg = self._run_javascript_coverage(
+            test_path, module_name, test_dir, debug
+        )
+        
+        result.tests_passed = passed
+        result.tests_failed = failed
+        
+        # ========== STEP 3: If Error, Fix (Maintenance) ==========
+        if error_msg:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+            result.had_errors = True
+            result.errors_remain = True
+            if verbose:
+                print(f"              ✗ Tests have errors, attempting fix...")
+            
+            for attempt in range(3):
+                result.fix_attempts += 1
+                try:
+                    current_test = test_path.read_text(encoding='utf-8', errors='replace')
+                    fixed_test = bot.repair_test(
+                        current_test, error_msg, "test_error"
+                    )
+                    
+                    if fixed_test:
+                        test_path.write_text(fixed_test, encoding='utf-8')
+                        
+                        # Re-run coverage
+                        coverage, passed, failed, error_msg = self._run_javascript_coverage(
+                            test_path, module_name, test_dir, debug
+                        )
+                        
+                        result.tests_passed = passed
+                        result.tests_failed = failed
+                        
+                        if not error_msg:
+                            result.errors_fixed = True
+                            result.errors_remain = False
+                            if attempt == 0:
+                                result.first_attempt_fix = True
+                            if verbose:
+                                print(f"              ✓ Fixed on attempt {attempt + 1}")
+                            break
+                except Exception as e:
+                    if debug:
+                        print(f"              [DEBUG] Fix attempt {attempt + 1} failed: {e}")
+            
+            if result.errors_remain and verbose:
+                print(f"              ✗ Could not fix after {result.fix_attempts} attempts")
+        else:
+            if verbose:
+                print(f"        [2/3] Test Maintenance...")
+                print(f"              No errors to fix")
+        
+        # Record coverage
+        if coverage is not None:
+            result.line_coverage_pct = coverage
+            if verbose:
+                print(f"              Coverage: {coverage:.1f}%")
+        
+        # ========== STEP 4: If No Error, Run Mutation Testing (Execution) ==========
+        if verbose:
+            print(f"        [3/3] Test Execution (Mutation Testing)...")
+        
+        if debug:
+            print(f"              [DEBUG] JS mutation check: errors_remain={result.errors_remain}, tests_passed={result.tests_passed}")
+        
+        if not result.errors_remain and result.tests_passed > 0:
+            mutation_results = self._run_javascript_mutation(
+                source_file, test_path, test_dir, module_name, debug
+            )
+            
+            result.mutants_total = mutation_results.get("total", 0)
+            result.mutants_killed = mutation_results.get("killed", 0)
+            result.mutants_survived = mutation_results.get("survived", 0)
+            
+            if result.mutants_total > 0:
+                result.mutation_score_pct = (result.mutants_killed / result.mutants_total) * 100
+                if verbose:
+                    print(f"              Mutants: {result.mutants_killed}/{result.mutants_total} killed ({result.mutation_score_pct:.1f}%)")
+            else:
+                if verbose:
+                    print(f"              No mutants generated")
+        else:
+            if verbose:
+                if result.errors_remain:
+                    print(f"              Skipped (errors remain)")
+                else:
+                    print(f"              Skipped (no passing tests: {result.tests_passed})")
+        
+        return result
+    
+    def _build_javascript_context(
+        self, 
+        source_code: str, 
+        module_name: str, 
+        module_contents: dict, 
+        all_source_files: list,
+        source_file: Path
+    ) -> str:
+        """Build source code with dependency context for JavaScript."""
+        # Find require/import statements
+        imports = []
+        # require('./module') or require('../module')
+        for match in re.finditer(r"require\s*\(\s*['\"]\.\.?\/(\w+)['\"]", source_code):
+            imports.append(match.group(1))
+        # import x from './module'
+        for match in re.finditer(r"from\s+['\"]\.\.?\/(\w+)['\"]", source_code):
+            imports.append(match.group(1))
+        
+        dependency_code = ""
+        for imp in imports:
+            if imp in module_contents and imp != module_name:
+                dep_content = module_contents[imp]
+                if len(dep_content) > 2000:
+                    dep_content = dep_content[:2000] + "\n// ... (truncated)"
+                dependency_code += f"\n\n// === DEPENDENCY: {imp}.js ===\n{dep_content}"
+        
+        if dependency_code:
+            return source_code + "\n\n// === PROJECT DEPENDENCIES ===" + dependency_code
+        elif len(all_source_files) > 1:
+            other_files = [sf.name for sf in all_source_files if sf != source_file]
+            if other_files:
+                return source_code + f"\n\n// NOTE: Project also contains: {', '.join(other_files)}"
+        
+        return source_code
+    
+    def _run_javascript_coverage(
+        self, 
+        test_path: Path, 
+        module_name: str, 
+        test_dir: Path, 
+        debug: bool
+    ) -> tuple:
+        """
+        Run Jest with coverage.
+        Returns: (coverage_pct, tests_passed, tests_failed, error_message)
+        """
+        # Clean old coverage
+        coverage_dir = test_dir / "coverage"
+        if coverage_dir.exists():
+            shutil.rmtree(coverage_dir)
+        
+        # Use correct command for Windows vs Unix
+        npx_cmd = "npx.cmd" if os.name == 'nt' else "npx"
+        
+        # Run Jest on just this test file
+        cmd = [npx_cmd, "jest", test_path.name, "--coverage", "--coverageReporters=json-summary", "--coverageReporters=text", "--no-cache"]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=120,
+                shell=(os.name == 'nt'),  # Use shell on Windows
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = result.stdout + result.stderr
+            
+            if debug:
+                print(f"              [DEBUG] Jest return code: {result.returncode}")
+                if result.returncode != 0:
+                    print(f"              [DEBUG] Output (last 500): {output[-500:]}")
+            
+            # Parse test counts from Jest output
+            passed = 0
+            failed = 0
+            
+            # Jest output format:
+            # "Test Suites: 1 failed, 1 total"
+            # "Tests:       22 failed, 35 passed, 57 total"
+            # We want the "Tests:" line, not "Test Suites:"
+            
+            # Find the Tests: line specifically
+            tests_line_match = re.search(r'Tests:\s+(.+)', output)
+            if tests_line_match:
+                tests_line = tests_line_match.group(1)
+                # Parse passed from this line
+                passed_match = re.search(r'(\d+)\s+passed', tests_line)
+                if passed_match:
+                    passed = int(passed_match.group(1))
+                # Parse failed from this line
+                failed_match = re.search(r'(\d+)\s+failed', tests_line)
+                if failed_match:
+                    failed = int(failed_match.group(1))
+            
+            if debug:
+                print(f"              [DEBUG] Parsed tests: {passed} passed, {failed} failed")
+            
+            # Check for ACTUAL errors (not assertion failures)
+            # Assertion failures (expect(...).toBe(...) failing) are expected behavior
+            # We only want to fix: SyntaxError, ReferenceError, TypeError, import errors, etc.
+            error_msg = None
+            if result.returncode != 0:
+                # Only trigger maintenance for real errors, not test assertion failures
+                # If tests ran (passed > 0 or "Tests:" in output with failures), it's not a code error
+                tests_actually_ran = passed > 0 or (failed > 0 and "expect(" in output.lower())
+                
+                if not tests_actually_ran:
+                    # Look for actual code/import errors (not assertion failures)
+                    error_patterns = [
+                        r'(SyntaxError[^\n]+)',
+                        r'(ReferenceError[^\n]+)',
+                        r'(TypeError:\s*\w+\s+is not a function[^\n]*)',  # Only "is not a function" type errors
+                        r'(TypeError:\s*Cannot read propert[^\n]*)',  # Property access errors
+                        r'(TypeError:\s*\w+\s+is not defined[^\n]*)',
+                        r'(Cannot find module[^\n]+)',
+                        r'(Module not found[^\n]+)',
+                        r'(Error:\s*Cannot find module[^\n]+)',
+                    ]
+                    
+                    for pattern in error_patterns:
+                        error_match = re.search(pattern, output, re.IGNORECASE)
+                        if error_match:
+                            error_msg = error_match.group(1)
+                            break
+                    
+                    # If no specific error found but no tests ran at all, there's likely a setup error
+                    if not error_msg and passed == 0 and failed == 0:
+                        # Check if it's a compilation/parse error
+                        if "SyntaxError" in output or "Cannot find module" in output or "is not defined" in output:
+                            error_msg = output[-500:]
+                
+                if debug and error_msg:
+                    print(f"              [DEBUG] Detected fixable error: {error_msg[:100]}")
+            
+            # Parse coverage from JSON summary
+            coverage_pct = None
+            coverage_summary = test_dir / "coverage" / "coverage-summary.json"
+            
+            if coverage_summary.exists():
+                try:
+                    with open(coverage_summary, encoding='utf-8') as f:
+                        cov_data = json.load(f)
+                        
+                        if debug:
+                            print(f"              [DEBUG] Coverage keys: {list(cov_data.keys())}")
+                        
+                        # Get coverage for the specific file
+                        for filepath, file_data in cov_data.items():
+                            if filepath == "total":
+                                continue
+                            # Extract just the filename from the full path for matching
+                            # Handle both forward and back slashes
+                            filename = filepath.replace('\\', '/').split('/')[-1]
+                            filename_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+                            
+                            if debug:
+                                print(f"              [DEBUG] Checking {filename_without_ext} against {module_name}")
+                            
+                            if filename_without_ext == module_name or module_name in filepath:
+                                coverage_pct = file_data.get("lines", {}).get("pct", 0.0)
+                                if debug:
+                                    print(f"              [DEBUG] Found coverage: {coverage_pct}%")
+                                break
+                        
+                        # Fallback to total
+                        if coverage_pct is None and "total" in cov_data:
+                            coverage_pct = cov_data["total"].get("lines", {}).get("pct", 0.0)
+                            if debug:
+                                print(f"              [DEBUG] Using total coverage: {coverage_pct}%")
+                                
+                except Exception as e:
+                    if debug:
+                        print(f"              [DEBUG] Error reading coverage: {e}")
+            
+            # Fallback: parse from terminal output
+            if coverage_pct is None:
+                cov_match = re.search(r'All files\s*\|\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*([\d.]+)', output)
+                if cov_match:
+                    coverage_pct = float(cov_match.group(1))
+            
+            return coverage_pct or 0.0, passed, failed, error_msg
+            
+        except subprocess.TimeoutExpired:
+            return 0.0, 0, 0, "Timeout"
+        except Exception as e:
+            return 0.0, 0, 0, str(e)
+    
+    def _run_javascript_mutation(
+        self, 
+        source_file: Path, 
+        test_path: Path,
+        test_dir: Path, 
+        module_name: str, 
+        debug: bool
+    ) -> dict:
+        """Run mutation testing on a single JavaScript file."""
+        results = {"total": 0, "killed": 0, "survived": 0}
+        
+        source_in_test_dir = test_dir / source_file.name
+        if not source_in_test_dir.exists():
+            return results
+        
+        original_code = source_in_test_dir.read_text(encoding='utf-8', errors='replace')
+        
+        # Generate mutants
+        mutants = self._generate_javascript_mutants(original_code)
+        
+        if debug:
+            print(f"              [DEBUG] Generated {len(mutants)} mutants")
+        
+        # Test each mutant (limit to 20)
+        for mutant_code in mutants[:20]:
+            killed = self._test_javascript_mutant(
+                source_in_test_dir, mutant_code, original_code,
+                test_path, test_dir
+            )
+            if killed:
+                results["killed"] += 1
+            else:
+                results["survived"] += 1
+        
+        results["total"] = min(len(mutants), 20)
+        
+        return results
+    
+    def _generate_javascript_mutants(self, code: str) -> list:
+        """Generate mutants for JavaScript code."""
+        mutants = []
+        
+        mutations = [
+            # Comparison operators
+            (r'===', '!=='), (r'!==', '==='),
+            (r'==', '!='), (r'!=', '=='),
+            (r'<=', '>'), (r'>=', '<'),
+            (r'<(?!=)', '>='), (r'>(?!=)', '<='),
+            # Arithmetic operators
+            (r'\+(?!=)', '-'), (r'-(?!=)', '+'),
+            (r'\*(?!=)', '/'), (r'/(?!=)', '*'),
+            # Logical operators
+            (r'&&', '||'), (r'\|\|', '&&'),
+            # Boolean literals
+            (r'\btrue\b', 'false'), (r'\bfalse\b', 'true'),
+            # Null/undefined checks
+            (r'=== null', '!== null'), (r'!== null', '=== null'),
+            (r'=== undefined', '!== undefined'), (r'!== undefined', '=== undefined'),
+            # Negation
+            (r'!(?!=)', ''),
+        ]
+        
+        for pattern, replacement in mutations:
+            for match in re.finditer(pattern, code):
+                mutant = code[:match.start()] + replacement + code[match.end():]
+                if mutant != code:
+                    mutants.append(mutant)
+        
+        return mutants
+    
+    def _test_javascript_mutant(
+        self, 
+        source_path: Path, 
+        mutant_code: str, 
+        original_code: str, 
+        test_path: Path, 
+        test_dir: Path
+    ) -> bool:
+        """Test if a JavaScript mutant is killed. Returns True if killed."""
+        # Apply mutant
+        source_path.write_text(mutant_code, encoding='utf-8')
+        
+        # Use correct command for Windows vs Unix
+        npx_cmd = "npx.cmd" if os.name == 'nt' else "npx"
+        
+        try:
+            result = subprocess.run(
+                [npx_cmd, "jest", test_path.name, "--no-cache", "--silent"],
+                capture_output=True,
+                text=True,
+                cwd=str(test_dir),
+                timeout=30,
+                shell=(os.name == 'nt'),  # Use shell on Windows
+                encoding='utf-8',
+                errors='replace'
+            )
+            killed = result.returncode != 0
+        except:
+            killed = True
+        finally:
+            # Restore original
+            source_path.write_text(original_code, encoding='utf-8')
+        
+        return killed
     
     def _print_project_summary(self, results: List[FileResult]):
         """Print summary for a project."""
